@@ -894,6 +894,49 @@ def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str, watch_
         if float(c.get("ton") or 0.0) <= 0:
             continue
         out.append(c)
+    if out:
+        return out
+
+    # Router-account fallback: some Groypad / memepad buys expose the token transfer only on
+    # the buyer-side event trace, not inside the watched router account tx out messages.
+    in_op = _msg_opcode(in_msg)
+    dst_addr = _msg_addr_deep((in_msg.get("destination") if isinstance(in_msg, dict) else None) or (in_msg.get("dest") if isinstance(in_msg, dict) else None) or (in_msg.get("dst") if isinstance(in_msg, dict) else None) or in_msg)
+    allowed_dst = {a for a in (token_addr, watch_addr) if a}
+    if buyer and ton_in > 0 and (in_op == "0xa5a7cbf8" or (dst_addr and dst_addr in allowed_dst)):
+        return blum_extract_buy_from_recent_buyer_events(buyer, token_addr, tx_hash, watch_addr)
+    return []
+
+def blum_extract_buy_from_recent_buyer_events(buyer: str, token_addr: str, tx_hash: str, watch_addr: str = "") -> List[Dict[str, Any]]:
+    """Fallback for memepad txs where the router account tx lacks the jetton out message.
+
+    Some Groypad launches expose the token transfer only on the buyer event/trace, while the
+    router account transaction shows only the inbound buy call. We look at the buyer's recent
+    account events and match by the exact underlying tx hash when possible.
+    """
+    buyer = str(buyer or "").strip()
+    if not buyer:
+        return []
+    try:
+        evs = tonapi_account_events(buyer, 8)
+    except Exception:
+        evs = []
+    if not isinstance(evs, list) or not evs:
+        return []
+    out: List[Dict[str, Any]] = []
+    tx_hex = _normalize_tx_hash_to_hex(tx_hash)
+    for ev in evs:
+        if not isinstance(ev, dict):
+            continue
+        if tx_hex and not tonapi_event_matches_tx(ev, tx_hash):
+            continue
+        buys = blum_extract_buys_from_tonapi_event(ev, token_addr, watch_addr)
+        for b in buys:
+            if str(b.get("buyer") or "").strip() != buyer:
+                continue
+            b["tx"] = tx_hash or b.get("tx")
+            out.append(b)
+        if out:
+            break
     return out
 
 def blum_progress_from_buys(token: Dict[str, Any], buys: List[Dict[str, Any]]) -> None:
@@ -1787,13 +1830,12 @@ def tonapi_account_events_subject(address: str, limit: int = 30) -> List[Dict[st
     ev = js.get("events") if isinstance(js, dict) else None
     return ev if isinstance(ev, list) else []
 
-def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
-    """Best-effort extraction of a real tx hash from a TonAPI event."""
+def tonapi_event_tx_hashes(ev: Dict[str, Any]) -> List[str]:
+    """Extract real blockchain tx hashes referenced by a TonAPI event."""
+    out: List[str] = []
+    seen = set()
     if not isinstance(ev, dict):
-        return ""
-    eid = str(ev.get("event_id") or ev.get("id") or "").strip()
-    if eid:
-        return eid
+        return out
     for act in (ev.get("actions") or []):
         if not isinstance(act, dict):
             continue
@@ -1805,17 +1847,41 @@ def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
         for t in bt:
             if not isinstance(t, dict):
                 continue
+            vals = []
             tid = t.get("transaction_id") or t.get("transactionId") or {}
             if isinstance(tid, dict):
-                h = tid.get("hash") or tid.get("tx_hash") or tid.get("id")
-                h = str(h or "").strip()
-                if h:
-                    return h
-            h2 = t.get("hash") or t.get("tx_hash") or t.get("id")
-            h2 = str(h2 or "").strip()
-            if h2:
-                return h2
-    return ""
+                vals.extend([tid.get("hash"), tid.get("tx_hash"), tid.get("id")])
+            vals.extend([t.get("hash"), t.get("tx_hash"), t.get("id")])
+            for v in vals:
+                h = str(v or "").strip()
+                if h and h not in seen:
+                    seen.add(h)
+                    out.append(h)
+    return out
+
+
+def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
+    """Best-effort extraction of a real tx hash from a TonAPI event."""
+    hashes = tonapi_event_tx_hashes(ev)
+    if hashes:
+        return hashes[0]
+    if not isinstance(ev, dict):
+        return ""
+    return str(ev.get("event_id") or ev.get("id") or "").strip()
+
+
+def tonapi_event_matches_tx(ev: Dict[str, Any], tx_hash: str) -> bool:
+    tx_hex = _normalize_tx_hash_to_hex(tx_hash)
+    tx_raw = str(tx_hash or "").strip()
+    if not tx_hex and not tx_raw:
+        return False
+    for h in tonapi_event_tx_hashes(ev):
+        if h == tx_raw:
+            return True
+        h_hex = _normalize_tx_hash_to_hex(h)
+        if tx_hex and h_hex and h_hex == tx_hex:
+            return True
+    return False
 
 def tonapi_find_tx_hash_by_lt(account: str, lt: str, limit: int = 40) -> str:
     """Find a real transaction hash for an account by LT (with cache + adaptive scan).
