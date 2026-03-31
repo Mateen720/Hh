@@ -903,41 +903,103 @@ def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str, watch_
     dst_addr = _msg_addr_deep((in_msg.get("destination") if isinstance(in_msg, dict) else None) or (in_msg.get("dest") if isinstance(in_msg, dict) else None) or (in_msg.get("dst") if isinstance(in_msg, dict) else None) or in_msg)
     allowed_dst = {a for a in (token_addr, watch_addr) if a}
     if buyer and ton_in > 0 and (in_op == "0xa5a7cbf8" or (dst_addr and dst_addr in allowed_dst)):
-        return blum_extract_buy_from_recent_buyer_events(buyer, token_addr, tx_hash, watch_addr)
+        return blum_extract_buy_from_recent_buyer_events(
+            buyer,
+            token_addr,
+            tx_hash,
+            watch_addr,
+            ton_hint=ton_in,
+            utime_hint=utime,
+        )
     return []
 
-def blum_extract_buy_from_recent_buyer_events(buyer: str, token_addr: str, tx_hash: str, watch_addr: str = "") -> List[Dict[str, Any]]:
+def _is_close_amount(a: float, b: float, rel: float = 0.08, abs_tol: float = 0.35) -> bool:
+    try:
+        a = float(a or 0.0)
+        b = float(b or 0.0)
+    except Exception:
+        return False
+    if a <= 0 or b <= 0:
+        return False
+    return abs(a - b) <= max(abs_tol, max(a, b) * rel)
+
+
+def blum_extract_buy_from_recent_buyer_events(
+    buyer: str,
+    token_addr: str,
+    tx_hash: str,
+    watch_addr: str = "",
+    ton_hint: float = 0.0,
+    utime_hint: int = 0,
+) -> List[Dict[str, Any]]:
     """Fallback for memepad txs where the router account tx lacks the jetton out message.
 
-    Some Groypad launches expose the token transfer only on the buyer event/trace, while the
-    router account transaction shows only the inbound buy call. We look at the buyer's recent
-    account events and match by the exact underlying tx hash when possible.
+    Important nuance: the router/launch contract transaction hash is often *different* from the
+    buyer-wallet transaction hash for the same logical buy. So an exact hash match is helpful when
+    present, but must not be required. We therefore score recent buyer events by:
+      1) exact trace hash match when available
+      2) same buyer + same jetton
+      3) TON spent close to the router-side observed amount
+      4) event timestamp close to the router-side observed timestamp
     """
     buyer = str(buyer or "").strip()
     if not buyer:
         return []
     try:
-        evs = tonapi_account_events(buyer, 8)
+        evs = tonapi_account_events(buyer, 12)
     except Exception:
         evs = []
     if not isinstance(evs, list) or not evs:
         return []
-    out: List[Dict[str, Any]] = []
+
     tx_hex = _normalize_tx_hash_to_hex(tx_hash)
+    exact_matches: List[Dict[str, Any]] = []
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+
     for ev in evs:
         if not isinstance(ev, dict):
             continue
-        if tx_hex and not tonapi_event_matches_tx(ev, tx_hash):
-            continue
+        ts = 0
+        try:
+            ts = int(ev.get("timestamp") or 0)
+        except Exception:
+            ts = 0
+        ev_exact = bool(tx_hex and tonapi_event_matches_tx(ev, tx_hash))
         buys = blum_extract_buys_from_tonapi_event(ev, token_addr, watch_addr)
         for b in buys:
             if str(b.get("buyer") or "").strip() != buyer:
                 continue
-            b["tx"] = tx_hash or b.get("tx")
-            out.append(b)
-        if out:
-            break
-    return out
+            bb = dict(b)
+            bb["tx"] = tx_hash or bb.get("tx")
+            if ev_exact:
+                exact_matches.append(bb)
+                continue
+
+            score = 0.0
+            ton_amt = float(bb.get("ton") or 0.0)
+            if ton_hint > 0 and _is_close_amount(ton_amt, ton_hint):
+                score += 100.0 - abs(ton_amt - ton_hint) * 10.0
+            elif ton_hint > 0:
+                # Wrong TON amount is usually a different buy.
+                continue
+
+            if utime_hint and ts:
+                dt = abs(ts - int(utime_hint))
+                if dt > 300:
+                    continue
+                score += max(0.0, 50.0 - (dt / 6.0))
+            elif ts:
+                # Prefer fresher events if we have no router-side timestamp.
+                score += max(0.0, ts)
+
+            scored.append((score, bb))
+
+    if exact_matches:
+        return exact_matches
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [scored[0][1]]
+    return []
 
 def blum_progress_from_buys(token: Dict[str, Any], buys: List[Dict[str, Any]]) -> None:
     """Update a lightweight bonding progress estimate for display.
