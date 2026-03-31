@@ -74,6 +74,16 @@ BLUM_BONDING_CAP_TON = float(os.getenv("BLUM_BONDING_CAP_TON", "1500").strip() o
 BLUM_EVENT_LIMIT = max(20, int(float(os.getenv("BLUM_EVENT_LIMIT", "80"))))
 BLUM_TX_LIMIT = max(20, int(float(os.getenv("BLUM_TX_LIMIT", "80"))))
 
+# Known Groypad / memepad launch router contracts per token.
+# These launches often route buys through a dedicated contract instead of the jetton master,
+# so polling only the token address misses the buy. Add more entries as users provide samples.
+GROYPAD_WATCH_BY_TOKEN: Dict[str, str] = {
+    "EQAOQNg9yr0xNNR45Ebm3Sa2f3Wo5-blxlUGKZhI_b2OLF5d": "EQA0E6xq3nxkM_DF5m2E_U1WlvLFcG9H7k6ptUbcCIuYOrM9",
+}
+
+def groypad_watch_address(token_addr: str) -> str:
+    return str(GROYPAD_WATCH_BY_TOKEN.get(str(token_addr or "").strip()) or "").strip()
+
 DATA_FILE = _data_path(os.getenv("GROUPS_FILE", "groups_public.json"))
 SEEN_FILE = _data_path(os.getenv("SEEN_FILE", "seen_public.json"))
 # -------------------- AMOUNT HELPERS --------------------
@@ -590,6 +600,7 @@ def blum_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> 
     if not isinstance(ev, dict):
         return []
     token_addr = str(token_addr or "").strip()
+    watch_addr = str(watch_addr or "").strip()
     if not token_addr:
         return []
 
@@ -706,17 +717,13 @@ def blum_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> 
 
 
 def _msg_addr_deep(x: Any) -> str:
-    """Best-effort address extractor from TonAPI / TonCenter message-like objects."""
+    """Best-effort address extractor from TonAPI message-like objects."""
     if x is None:
         return ""
     if isinstance(x, str):
         return x.strip()
     if isinstance(x, dict):
-        for k in (
-            "address", "account", "account_address", "owner", "jetton_wallet", "wallet",
-            "addr", "source", "destination", "src", "dst", "sender", "recipient",
-            "from", "to", "response_address", "responseAddress",
-        ):
+        for k in ("address", "account", "addr", "source", "destination", "src", "dst"):
             v = x.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
@@ -724,44 +731,21 @@ def _msg_addr_deep(x: Any) -> str:
                 inner = _msg_addr_deep(v)
                 if inner:
                     return inner
-        for v in x.values():
-            if isinstance(v, dict):
-                inner = _msg_addr_deep(v)
-                if inner:
-                    return inner
     return ""
-
-def _norm_opcode_value(v: Any) -> str:
-    if v is None:
-        return ""
-    if isinstance(v, int):
-        return hex(v).lower()
-    s = str(v).strip().lower()
-    if not s:
-        return ""
-    if s.isdigit():
-        try:
-            return hex(int(s)).lower()
-        except Exception:
-            return s
-    return s
-
 
 def _msg_opcode(msg: Any) -> str:
     if not isinstance(msg, dict):
         return ""
     for k in ("opcode", "op_code", "opCode", "decoded_op_name", "decodedOpName", "operation"):
         v = msg.get(k)
-        op = _norm_opcode_value(v)
-        if op:
-            return op
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
     body = msg.get("decoded_body") or msg.get("decodedBody") or msg.get("body")
     if isinstance(body, dict):
         for k in ("opcode", "op_code", "opCode", "operation", "type", "@type", "name"):
             v = body.get(k)
-            op = _norm_opcode_value(v)
-            if op:
-                return op
+            if isinstance(v, str) and v.strip():
+                return v.strip().lower()
     return ""
 
 def _msg_value_ton(msg: Any) -> float:
@@ -785,31 +769,17 @@ def _msg_value_ton(msg: Any) -> float:
             continue
     return 0.0
 
-def _find_amount_deep(x: Any) -> Any:
-    if x is None:
-        return None
-    if isinstance(x, dict):
-        for k in ("amount", "jetton_amount", "token_amount", "forward_ton_amount", "coins"):
-            v = x.get(k)
-            if v is not None:
-                return v
-        for v in x.values():
-            if isinstance(v, dict):
-                found = _find_amount_deep(v)
-                if found is not None:
-                    return found
-    return None
-
-
 def _msg_body_amount(msg: Any, decimals: int = 9) -> float:
     if not isinstance(msg, dict):
         return 0.0
     raw = None
     body = msg.get("decoded_body") or msg.get("decodedBody") or msg.get("body")
     if isinstance(body, dict):
-        raw = _find_amount_deep(body)
+        raw = body.get("amount")
+        if raw is None:
+            raw = body.get("jetton_amount") or body.get("token_amount")
     if raw is None:
-        raw = _find_amount_deep(msg)
+        raw = msg.get("amount")
     s = str(raw or "").strip()
     if not s:
         return 0.0
@@ -820,45 +790,17 @@ def _msg_body_amount(msg: Any, decimals: int = 9) -> float:
     except Exception:
         return 0.0
 
-LAUNCHPAD_BUY_OPS = {
-    "0xa5a7cbf8",  # observed on Groypad/DTrade-style launchpad buy calls
-    "0xa5a7cbf8",
-    "a5a7cbf8",
-}
+def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str, watch_addr: str = "") -> List[Dict[str, Any]]:
+    """Raw TonAPI blockchain transaction fallback for Blum bonding buys.
 
-# Best-effort Groypad watch-address map.
-# Important: launchpad buys often hit a router/launchpad contract, not the jetton master itself,
-# so polling the token master account can miss them entirely. When we know the launchpad contract
-# from a sample tx, we watch that contract instead.
-GROYPAD_WATCH_BY_TOKEN = {
-    # IGOR sample supplied by user on 2026-03-30
-    "EQAOQNg9yr0xNNR45Ebm3Sa2f3Wo5-blxlUGKZhI_b2OLF5d": "0:71f1326c1bd3a07e938982e54711ed2ce56b38d1304ce432340f2bc3a404f6a1",
-}
-
-def launchpad_watch_address(token: Dict[str, Any]) -> str:
-    if not isinstance(token, dict):
-        return ""
-    explicit = str(token.get("launchpad_watch") or token.get("watch_address") or "").strip()
-    if explicit:
-        return explicit
-    addr = str(token.get("address") or "").strip()
-    if str(token.get("launchpad") or "").lower() == "groypad":
-        mapped = GROYPAD_WATCH_BY_TOKEN.get(addr)
-        if mapped:
-            return mapped
-    return addr
-
-
-def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
-    """Raw TonAPI blockchain transaction fallback for bonding / launchpad buys.
-
-    This covers the earlier Blum-style bonding flow and Groypad-like launchpad buys
-    where the wallet sends TON into a launchpad/router contract and the user receives
-    an outgoing Jetton Transfer / Jetton Internal Transfer in the same transaction.
+    This targets the exact pattern seen on Blum bonding transactions:
+      - incoming wallet -> jetton master with attached TON
+      - outgoing JettonInternalTransfer from jetton master / wallet
     """
     if not isinstance(tx, dict):
         return []
     token_addr = str(token_addr or "").strip()
+    watch_addr = str(watch_addr or "").strip()
     if not token_addr:
         return []
 
@@ -884,14 +826,6 @@ def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> Lis
 
     buyer = _msg_addr_deep((in_msg.get("source") if isinstance(in_msg, dict) else None) or (in_msg.get("src") if isinstance(in_msg, dict) else None) or in_msg)
     ton_in = _msg_value_ton(in_msg)
-    in_op = _msg_opcode(in_msg)
-    try:
-        in_blob = json.dumps((in_msg.get("decoded_body") or in_msg.get("decodedBody") or in_msg.get("body") or {}), ensure_ascii=False).lower() if isinstance(in_msg, dict) else ""
-    except Exception:
-        in_blob = ""
-    launchpad_like_in = any(x in (in_op or "") for x in LAUNCHPAD_BUY_OPS) or any(x in in_blob for x in LAUNCHPAD_BUY_OPS)
-    if (not launchpad_like_in) and ton_in > 0 and tx_hash and ("groypad" in in_blob or "dtrade" in in_blob):
-        launchpad_like_in = True
 
     candidates = []
     for m in out_msgs:
@@ -902,33 +836,29 @@ def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> Lis
         text_blob = json.dumps(body, ensure_ascii=False).lower() if isinstance(body, dict) else str(body).lower()
         src_addr = _msg_addr_deep((m.get("source") if isinstance(m, dict) else None) or (m.get("src") if isinstance(m, dict) else None) or m)
         dst_addr = _msg_addr_deep((m.get("destination") if isinstance(m, dict) else None) or (m.get("dest") if isinstance(m, dict) else None) or (m.get("dst") if isinstance(m, dict) else None) or m)
-        amt_probe = _msg_body_amount(m, token_decimals)
         looks_like_jetton_out = (
-            "0xf8a7ea5" in op
-            or "178d4519" in op
-            or "0x178d4519" in op
-            or "jettontransfer" in op
-            or "jetton transfer" in op
+            "178d4519" in op
             or "jettoninternaltransfer" in op
             or "jetton internal transfer" in op
             or "internal transfer" in op
-            or "0xf8a7ea5" in text_blob
             or "178d4519" in text_blob
-            or "0x178d4519" in text_blob
-            or "jettontransfer" in text_blob
-            or "jetton transfer" in text_blob
             or "jettoninternaltransfer" in text_blob
             or "jetton internal transfer" in text_blob
             or "internal transfer" in text_blob
         )
         if not looks_like_jetton_out:
-            # Some bonding / launchpad txs are decoded without opcode text.
-            # Accept positive jetton-like out legs if the incoming call looked like a launchpad buy.
-            # For Groypad / DTrade launchpad mode, a positive token-like amount on an outgoing leg
-            # in a tx that also sends TON into the watched contract is enough to count as a buy.
-            if not ((src_addr == token_addr and amt_probe > 0) or (launchpad_like_in and amt_probe > 0) or (ton_in > 0 and amt_probe > 0)):
+            # Some bonding / memepad txs are decoded without opcode text.
+            # Accept positive jetton amounts sourced either from the jetton master
+            # or from a mapped launch/router contract we explicitly watch for this token.
+            amt_probe = _msg_body_amount(m, token_decimals)
+            allowed_src = {token_addr}
+            if watch_addr:
+                allowed_src.add(watch_addr)
+            if not ((src_addr in allowed_src) and amt_probe > 0):
                 continue
-        token_amount = amt_probe or _msg_body_amount(m, token_decimals)
+        else:
+            amt_probe = _msg_body_amount(m, token_decimals)
+        token_amount = amt_probe if "amt_probe" in locals() else _msg_body_amount(m, token_decimals)
         if token_amount <= 0:
             continue
         response_addr = ""
@@ -1033,14 +963,14 @@ I18N: Dict[str, Dict[str, str]] = {
     "lang_en": "🇬🇧 English",
     "lang_ru": "🇷🇺 Russian",
     "start_title": "🚀 *KYRON BuyBot*",
-    "start_desc": "Premium buy alerts for STON.fi + DeDust + Groypad launches (TON).\n\n• Add to a group\n• Configure token in 10 seconds\n• Clean buy posts + ads support\n\nUse the buttons below:",
+    "start_desc": "Premium buy alerts for STON.fi + DeDust (TON).\n\n• Add to a group\n• Configure token in 10 seconds\n• Clean buy posts + ads support\n\nUse the buttons below:",
     "connected_title": "✅ *KYRON BuyBot connected*",
-    "connected_desc": "Now send the token CA here in DM.\nI will auto-detect *STON.fi* / *DeDust* pools and also watch *Groypad* launchpad flow when no pool is live yet, then start posting buys in your group.\n\nTip: you can also include the token Telegram link in the same message.\nExample:\n`<CA> https://t.me/YourToken`",
+    "connected_desc": "Now send the token CA here in DM.\nI will auto-detect *STON.fi* / *DeDust* pools and start posting buys in your group.\n\nTip: you can also include the token Telegram link in the same message.\nExample:\n`<CA> https://t.me/YourToken`",
     "lang_set_ok": "Language saved: English ✅",
     "lang_set_ok_ru": "Language saved: Russian ✅",
     "need_admin": "Admins only.",
     "wiz_paste_title": "🛰 KYRON Setup — Paste Token CA",
-    "wiz_paste_hint": "STON.fi / DeDust / Groypad will be auto-detected.",
+    "wiz_paste_hint": "STON.fi / DeDust will be auto-detected.",
     "wiz_found_title": "🔎 Token found",
     "wiz_confirm": "✅ Confirm",
     "wiz_edit": "✏️ Edit",
@@ -1068,14 +998,14 @@ I18N: Dict[str, Dict[str, str]] = {
     "lang_en": "🇬🇧 English",
     "lang_ru": "🇷🇺 Русский",
     "start_title": "🚀 *KYRON BuyBot*",
-    "start_desc": "Премиум-уведомления о покупках для STON.fi + DeDust + запусков Groypad (TON).\n\n• Добавьте в группу\n• Настройте токен за 10 секунд\n• Чистые buy-посты + поддержка рекламы\n\nИспользуйте кнопки ниже:",
+    "start_desc": "Премиум-уведомления о покупках для STON.fi + DeDust (TON).\n\n• Добавьте в группу\n• Настройте токен за 10 секунд\n• Чистые buy-посты + поддержка рекламы\n\nИспользуйте кнопки ниже:",
     "connected_title": "✅ *KYRON BuyBot подключён*",
-    "connected_desc": "Теперь отправьте сюда в ЛС адрес токена (CA).\nЯ автоматически найду пулы *STON.fi* / *DeDust* и также буду отслеживать launchpad *Groypad*, если пул ещё не запущен, после чего начну постить покупки в вашей группе.\n\nСовет: можно добавить ссылку на Telegram токена в том же сообщении.\nПример:\n`<CA> https://t.me/YourToken`",
+    "connected_desc": "Теперь отправьте сюда в ЛС адрес токена (CA).\nЯ автоматически найду пулы *STON.fi* / *DeDust* и начну постить покупки в вашей группе.\n\nСовет: можно добавить ссылку на Telegram токена в том же сообщении.\nПример:\n`<CA> https://t.me/YourToken`",
     "lang_set_ok": "Язык сохранён: English ✅",
     "lang_set_ok_ru": "Язык сохранён: Русский ✅",
     "need_admin": "Только для админов.",
     "wiz_paste_title": "🛰 Настройка KYRON — отправьте CA",
-    "wiz_paste_hint": "STON.fi / DeDust / Groypad будут определены автоматически.",
+    "wiz_paste_hint": "Пулы STON.fi / DeDust будут найдены автоматически.",
     "wiz_found_title": "🔎 Токен найден",
     "wiz_confirm": "✅ Подтвердить",
     "wiz_edit": "✏️ Изменить",
@@ -1497,8 +1427,7 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
             tok0 = g0.get("token") if isinstance(g0, dict) else None
             if isinstance(tok0, dict) and bool(tok0.get("blum_mode")) and tok0.get("address"):
                 total_ton = 0.0
-                watch_addr0 = launchpad_watch_address(tok0)
-                evs = await _to_thread(tonapi_account_events, watch_addr0, BLUM_EVENT_LIMIT)
+                evs = await _to_thread(tonapi_account_events, tok0.get("address"), BLUM_EVENT_LIMIT)
                 if isinstance(evs, list) and evs:
                     newest = evs[0]
                     newest_blum_eid = str(newest.get("event_id") or newest.get("id") or "").strip() or None
@@ -1513,7 +1442,7 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                                 total_ton += max(0.0, float(b.get("ton") or 0.0))
                             except Exception:
                                 pass
-                txs = await _to_thread(tonapi_account_transactions, watch_addr0, BLUM_TX_LIMIT)
+                txs = await _to_thread(tonapi_account_transactions, tok0.get("address"), BLUM_TX_LIMIT)
                 if isinstance(txs, list) and txs:
                     newest_tx0 = txs[0]
                     newest_blum_tx = str(_tx_hash(newest_tx0) or "").strip() or None
@@ -1652,10 +1581,18 @@ def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
       - name, symbol
       - decimals (int, default 9)
       - holders_count (best-effort)
+      - total_supply_raw / total_supply_human (best-effort)
 
     Note: Some DEX endpoints return amounts in minimal units, so decimals are critical.
     """
-    out: Dict[str, Any] = {"name": "", "symbol": "", "decimals": 9, "holders_count": None}
+    out: Dict[str, Any] = {
+        "name": "",
+        "symbol": "",
+        "decimals": 9,
+        "holders_count": None,
+        "total_supply_raw": None,
+        "total_supply_human": None,
+    }
     js = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton}")
     if not js:
         return out
@@ -1691,6 +1628,31 @@ def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # total supply (best-effort; TonAPI shape can vary)
+    try:
+        supply_val = None
+        for k in ("total_supply", "totalSupply", "supply", "jetton_supply", "max_supply", "maxSupply"):
+            sv = js.get(k)
+            if sv not in (None, ""):
+                supply_val = sv
+                break
+        if supply_val in (None, "") and isinstance(meta, dict):
+            for k in ("total_supply", "totalSupply", "supply", "jetton_supply", "max_supply", "maxSupply"):
+                sv = meta.get(k)
+                if sv not in (None, ""):
+                    supply_val = sv
+                    break
+        if supply_val not in (None, ""):
+            raw_s = str(supply_val).strip()
+            if raw_s:
+                out["total_supply_raw"] = raw_s
+                if "." in raw_s:
+                    out["total_supply_human"] = float(raw_s)
+                else:
+                    out["total_supply_human"] = float(raw_s) / float(10 ** int(out.get("decimals") or 9))
+    except Exception:
+        pass
+
     return out
 
 def tonapi_jetton_holders_count(jetton: str) -> Optional[int]:
@@ -1717,6 +1679,68 @@ def tonapi_jetton_holders_count(jetton: str) -> Optional[int]:
         return None
     except Exception:
         return None
+
+
+def tonapi_jetton_top_holders(jetton: str, limit: int = 10) -> List[str]:
+    """Return top holder addresses for a jetton.
+
+    Used as a generic memepad / Groypad fallback: launch contracts often sit among the
+    largest holders while bonding is active, so polling a few top holders catches
+    wallet->launch-contract buy calls that never hit the jetton master directly.
+    """
+    out: List[str] = []
+    try:
+        data = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton}/holders", params={"limit": max(1, min(int(limit or 10), 20)), "offset": 0})
+        rows = []
+        if isinstance(data, dict):
+            rows = data.get("addresses") or data.get("holders") or data.get("items") or data.get("accounts") or []
+        if not isinstance(rows, list):
+            rows = []
+
+        def _pick_addr(row: Any) -> str:
+            if isinstance(row, dict):
+                for key in ("address", "owner", "account", "wallet"):
+                    val = row.get(key)
+                    if isinstance(val, dict):
+                        a = str(val.get("address") or val.get("account") or "").strip()
+                        if a:
+                            return a
+                    a = str(val or "").strip()
+                    if a:
+                        return a
+            return str(row or "").strip()
+
+        seen = set()
+        for row in rows:
+            a = _pick_addr(row)
+            if not a or a == jetton or a in seen:
+                continue
+            seen.add(a)
+            out.append(a)
+            if len(out) >= max(1, min(int(limit or 10), 20)):
+                break
+    except Exception:
+        return []
+    return out
+
+
+def guess_memepad_watch_addresses(jetton: str) -> List[str]:
+    addrs: List[str] = []
+    try:
+        known = groypad_watch_address(jetton)
+        if known:
+            addrs.append(known)
+    except Exception:
+        pass
+    try:
+        for a in tonapi_jetton_top_holders(jetton, 8):
+            if a and a not in addrs and a != jetton:
+                addrs.append(a)
+            if len(addrs) >= 4:
+                break
+    except Exception:
+        pass
+    return addrs
 
 
 def tonapi_account_transactions(address: str, limit: int = 12) -> List[Dict[str, Any]]:
@@ -2671,11 +2695,15 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Seed holders and decimals
     holders_seed: Optional[int] = None
+    total_supply_seed: Optional[float] = None
     try:
         info_h = tonapi_jetton_info(jetton)
         hh = info_h.get("holders_count")
         if hh is not None:
             holders_seed = int(hh)
+        ts_h = info_h.get("total_supply_human")
+        if ts_h is not None:
+            total_supply_seed = float(ts_h)
     except Exception:
         pass
     if holders_seed is None:
@@ -2705,11 +2733,13 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "symbol": sym,
         "decimals": int(decimals_seed) if str(decimals_seed).isdigit() else 9,
         "holders": holders_seed,
+        "total_supply": total_supply_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
-        "launchpad": ("groypad" if (bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")) or (not ston_pool and not dedust_pool)) else ""),
-        "launchpad_watch": GROYPAD_WATCH_BY_TOKEN.get(jetton, ""),
+        "watch_addresses": (guess_memepad_watch_addresses(jetton) or [jetton]),
+        "watch_address": ((guess_memepad_watch_addresses(jetton) or [jetton])[0]),
+        "launchpad": ("groypad" if guess_memepad_watch_addresses(jetton) else ""),
+        "blum_mode": bool(guess_memepad_watch_addresses(jetton) or ((not ston_pool) and (not dedust_pool))),
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
         "blum_progress_pct": 0.0,
@@ -4065,11 +4095,15 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
     dex_mode = (dex_mode or "both").lower().strip()
     # Seed holders once at setup so first buys show holders immediately.
     holders_seed: Optional[int] = None
+    total_supply_seed: Optional[float] = None
     try:
         info_h = tonapi_jetton_info(jetton)
         hh = info_h.get("holders_count")
         if hh is not None:
             holders_seed = int(hh)
+        ts_h = info_h.get("total_supply_human")
+        if ts_h is not None:
+            total_supply_seed = float(ts_h)
     except Exception:
         pass
     if holders_seed is None:
@@ -4162,9 +4196,10 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
-        "launchpad": ("groypad" if (bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")) or (not ston_pool and not dedust_pool)) else ""),
-        "launchpad_watch": GROYPAD_WATCH_BY_TOKEN.get(jetton, ""),
+        "watch_addresses": (guess_memepad_watch_addresses(jetton) or [jetton]),
+        "watch_address": ((guess_memepad_watch_addresses(jetton) or [jetton])[0]),
+        "launchpad": ("groypad" if guess_memepad_watch_addresses(jetton) else ""),
+        "blum_mode": bool(guess_memepad_watch_addresses(jetton) or ((not ston_pool) and (not dedust_pool))),
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
         "blum_progress_pct": 0.0,
@@ -4585,131 +4620,133 @@ async def poll_once(app: Application):
 
         # Blum bonding fallback (no STON/DeDust pool yet)
         try:
-            token["blum_mode"] = bool(
-                token.get("blum_mode")
-                or token.get("launchpad_watch")
-                or (str(token.get("launchpad") or "").lower() == "groypad")
-                or ((not token.get("ston_pool")) and (not token.get("dedust_pool")))
-            )
+            token["blum_mode"] = bool(token.get("blum_mode") or ((not token.get("ston_pool")) and (not token.get("dedust_pool"))))
         except Exception:
-            token["blum_mode"] = bool(token.get("blum_mode")) or bool(token.get("launchpad_watch"))
+            token["blum_mode"] = bool(token.get("blum_mode"))
         if bool(token.get("blum_mode")) and token.get("address"):
             try:
                 ignore_before = int(token.get("ignore_before_ts") or 0)
+                watch_addrs: List[str] = []
+                for wa in (token.get("watch_address"), *(token.get("watch_addresses") or []), token.get("address")):
+                    a = str(wa or "").strip()
+                    if a and a not in watch_addrs:
+                        watch_addrs.append(a)
+                if not watch_addrs:
+                    watch_addrs = [str(token.get("address") or "").strip()]
 
-                # 1) TonAPI events pass
-                watch_addr = launchpad_watch_address(token)
-                evs = await _to_thread(tonapi_account_events, watch_addr, BLUM_EVENT_LIMIT)
-                if isinstance(evs, list) and evs:
-                    last_eid = str(token.get("last_blum_event_id") or "").strip()
-                    try:
-                        last_ets = int(token.get("last_blum_event_ts") or 0)
-                    except Exception:
-                        last_ets = 0
+                for watch_addr in watch_addrs:
+                    # 1) TonAPI events pass
+                    evs = await _to_thread(tonapi_account_events, watch_addr, BLUM_EVENT_LIMIT)
+                    if isinstance(evs, list) and evs:
+                        last_eid = str(token.get(f"last_blum_event_id::{watch_addr}") or token.get("last_blum_event_id") or "").strip()
+                        try:
+                            last_ets = int(token.get(f"last_blum_event_ts::{watch_addr}") or token.get("last_blum_event_ts") or 0)
+                        except Exception:
+                            last_ets = 0
 
-                    if not last_eid and not last_ets:
-                        newest = evs[0]
-                        eid0 = str(newest.get("event_id") or newest.get("id") or "").strip()
-                        ts0 = int(newest.get("timestamp") or 0)
-                        if eid0:
-                            token["last_blum_event_id"] = eid0
-                        if ts0:
-                            token["last_blum_event_ts"] = ts0
+                        if not last_eid and not last_ets:
+                            newest = evs[0]
+                            eid0 = str(newest.get("event_id") or newest.get("id") or "").strip()
+                            ts0 = int(newest.get("timestamp") or 0)
+                            if eid0:
+                                token[f"last_blum_event_id::{watch_addr}"] = eid0
+                            if ts0:
+                                token[f"last_blum_event_ts::{watch_addr}"] = ts0
 
-                    new_events = []
-                    for ev in evs:
-                        if not isinstance(ev, dict):
-                            continue
-                        eid = str(ev.get("event_id") or ev.get("id") or "").strip()
-                        ts = int(ev.get("timestamp") or 0)
-                        if last_eid and eid == last_eid:
-                            break
-                        if last_ets and ts and ts <= last_ets:
-                            continue
-                        if ignore_before and ts and ts < ignore_before:
-                            continue
-                        new_events.append(ev)
-
-                    for ev in reversed(new_events):
-                        buys = blum_extract_buys_from_tonapi_event(ev, token["address"])
-                        posted_here = []
-                        for b in buys:
-                            ton_amt = float(b.get("ton") or 0.0)
-                            if ton_amt < min_buy:
+                        new_events = []
+                        for ev in evs:
+                            if not isinstance(ev, dict):
                                 continue
-                            txh = _normalize_tx_hash_to_hex(b.get("tx") or "")
-                            dedupe_key = ('tx:' + txh) if txh else ('blum:' + str(token.get("address")) + ':' + str(b.get("event_id") or b.get("tx") or ''))
-                            if not dedupe_ok(chat_id, dedupe_key):
-                                continue
-                            if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
-                                continue
-                            burst["count"] += 1
-                            await post_buy(app, chat_id, token, {
-                                "tx": b.get("tx"),
-                                "buyer": b.get("buyer"),
-                                "ton": ton_amt,
-                                "token_amount": float(b.get("token_amount") or 0.0),
-                            }, source=("Groypad" if str(token.get("launchpad") or "").lower()=="groypad" else "Blum"))
-                            posted_here.append(b)
-                        if posted_here:
-                            blum_progress_from_buys(token, posted_here)
-
-                        eid_new = str(ev.get("event_id") or ev.get("id") or "").strip()
-                        ts_new = int(ev.get("timestamp") or 0)
-                        if eid_new:
-                            token["last_blum_event_id"] = eid_new
-                        if ts_new:
-                            token["last_blum_event_ts"] = ts_new
-
-                # 2) Raw tx fallback for bonding buys like the supplied sample tx
-                txs = await _to_thread(tonapi_account_transactions, watch_addr, BLUM_TX_LIMIT)
-                if isinstance(txs, list) and txs:
-                    last_tx = str(token.get("last_blum_tx") or "").strip()
-                    last_lt = str(token.get("last_blum_lt") or "").strip()
-
-                    if not last_tx and not last_lt:
-                        token["last_blum_tx"] = str(_tx_hash(txs[0]) or "").strip()
-                        token["last_blum_lt"] = str(txs[0].get("lt") or "").strip()
-                    else:
-                        new_txs = []
-                        for txo in txs:
-                            if not isinstance(txo, dict):
-                                continue
-                            txh0 = str(_tx_hash(txo) or "").strip()
-                            lt0 = str(txo.get("lt") or "").strip()
-                            uts0 = 0
-                            try:
-                                uts0 = int(txo.get("utime") or txo.get("now") or txo.get("timestamp") or 0)
-                            except Exception:
-                                uts0 = 0
-                            if last_tx and txh0 and txh0 == last_tx:
+                            eid = str(ev.get("event_id") or ev.get("id") or "").strip()
+                            ts = int(ev.get("timestamp") or 0)
+                            if last_eid and eid == last_eid:
                                 break
-                            if last_lt and lt0 and lt0 == last_lt:
-                                break
-                            if ignore_before and uts0 and uts0 < ignore_before:
+                            if last_ets and ts and ts <= last_ets:
                                 continue
-                            new_txs.append(txo)
+                            if ignore_before and ts and ts < ignore_before:
+                                continue
+                            new_events.append(ev)
 
-                        for txo in reversed(new_txs):
-                            buys = blum_extract_buys_from_tonapi_tx(txo, token["address"])
+                        for ev in reversed(new_events):
+                            buys = blum_extract_buys_from_tonapi_event(ev, token["address"])
                             posted_here = []
                             for b in buys:
                                 ton_amt = float(b.get("ton") or 0.0)
                                 if ton_amt < min_buy:
                                     continue
-                                txh = _normalize_tx_hash_to_hex(b.get("tx") or _tx_hash(txo) or "")
-                                dedupe_key = ('tx:' + txh) if txh else ('blumtx:' + str(token.get("address")) + ':' + str(txo.get("lt") or ''))
+                                txh = _normalize_tx_hash_to_hex(b.get("tx") or "")
+                                dedupe_key = ('tx:' + txh) if txh else ('blum:' + str(token.get("address")) + ':' + str(b.get("event_id") or b.get("tx") or ''))
                                 if not dedupe_ok(chat_id, dedupe_key):
                                     continue
                                 if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
                                     continue
                                 burst["count"] += 1
                                 await post_buy(app, chat_id, token, {
-                                    "tx": b.get("tx") or _tx_hash(txo),
+                                    "tx": b.get("tx"),
                                     "buyer": b.get("buyer"),
                                     "ton": ton_amt,
                                     "token_amount": float(b.get("token_amount") or 0.0),
-                                }, source=("Groypad" if str(token.get("launchpad") or "").lower()=="groypad" else "Blum"))
+                                }, source="Blum")
+                                posted_here.append(b)
+                            if posted_here:
+                                blum_progress_from_buys(token, posted_here)
+
+                            eid_new = str(ev.get("event_id") or ev.get("id") or "").strip()
+                            ts_new = int(ev.get("timestamp") or 0)
+                            if eid_new:
+                                token[f"last_blum_event_id::{watch_addr}"] = eid_new
+                            if ts_new:
+                                token[f"last_blum_event_ts::{watch_addr}"] = ts_new
+
+                    # 2) Raw tx fallback for bonding buys like the supplied sample tx
+                    txs = await _to_thread(tonapi_account_transactions, watch_addr, BLUM_TX_LIMIT)
+                    if isinstance(txs, list) and txs:
+                        last_tx = str(token.get(f"last_blum_tx::{watch_addr}") or token.get("last_blum_tx") or "").strip()
+                        last_lt = str(token.get(f"last_blum_lt::{watch_addr}") or token.get("last_blum_lt") or "").strip()
+
+                        if not last_tx and not last_lt:
+                            token[f"last_blum_tx::{watch_addr}"] = str(_tx_hash(txs[0]) or "").strip()
+                            token[f"last_blum_lt::{watch_addr}"] = str(txs[0].get("lt") or "").strip()
+                        else:
+                            new_txs = []
+                            for txo in txs:
+                                if not isinstance(txo, dict):
+                                    continue
+                                txh0 = str(_tx_hash(txo) or "").strip()
+                                lt0 = str(txo.get("lt") or "").strip()
+                                uts0 = 0
+                                try:
+                                    uts0 = int(txo.get("utime") or txo.get("now") or txo.get("timestamp") or 0)
+                                except Exception:
+                                    uts0 = 0
+                                if last_tx and txh0 and txh0 == last_tx:
+                                    break
+                                if last_lt and lt0 and lt0 == last_lt:
+                                    break
+                                if ignore_before and uts0 and uts0 < ignore_before:
+                                    continue
+                                new_txs.append(txo)
+
+                            for txo in reversed(new_txs):
+                                buys = blum_extract_buys_from_tonapi_tx(txo, token["address"], watch_addr)
+                                posted_here = []
+                                for b in buys:
+                                    ton_amt = float(b.get("ton") or 0.0)
+                                    if ton_amt < min_buy:
+                                        continue
+                                    txh = _normalize_tx_hash_to_hex(b.get("tx") or _tx_hash(txo) or "")
+                                    dedupe_key = ('tx:' + txh) if txh else ('blumtx:' + str(token.get("address")) + ':' + str(txo.get("lt") or ''))
+                                    if not dedupe_ok(chat_id, dedupe_key):
+                                        continue
+                                    if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
+                                        continue
+                                    burst["count"] += 1
+                                    await post_buy(app, chat_id, token, {
+                                        "tx": b.get("tx") or _tx_hash(txo),
+                                        "buyer": b.get("buyer"),
+                                    "ton": ton_amt,
+                                    "token_amount": float(b.get("token_amount") or 0.0),
+                                }, source="Blum")
                                 posted_here.append(b)
                             if posted_here:
                                 blum_progress_from_buys(token, posted_here)
@@ -4831,6 +4868,46 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     if holders is not None:
         try:
             token["holders"] = int(holders)
+        except Exception:
+            pass
+
+    # Memepad / bonding fallback market stats.
+    # Before migration there is often no public pool yet, so GeckoTerminal returns nothing.
+    # In that case we derive a best-effort price from the current buy, liquidity from the
+    # observed bonding progress, and market cap from jetton supply when TonAPI exposes it.
+    total_supply = None
+    try:
+        if token.get("total_supply") is not None:
+            total_supply = float(token.get("total_supply"))
+    except Exception:
+        total_supply = None
+    if total_supply is None and jetton_addr:
+        try:
+            info = tonapi_jetton_info(jetton_addr)
+            ts_h = info.get("total_supply_human")
+            if ts_h is not None:
+                total_supply = float(ts_h)
+                token["total_supply"] = total_supply
+        except Exception:
+            pass
+
+    ton_usd = ton_usd_price()
+    if ton_usd and ton_usd > 0:
+        try:
+            if (price_usd is None) and ton_amt > 0 and tok_amt and float(tok_amt) > 0:
+                price_usd = (float(ton_amt) * float(ton_usd)) / float(tok_amt)
+        except Exception:
+            pass
+        try:
+            if liq_usd is None:
+                prog_ton = float(token.get("blum_progress_ton") or 0.0)
+                if prog_ton > 0:
+                    liq_usd = prog_ton * float(ton_usd)
+        except Exception:
+            pass
+        try:
+            if mc_usd is None and price_usd is not None and total_supply is not None and float(total_supply) > 0:
+                mc_usd = float(price_usd) * float(total_supply)
         except Exception:
             pass
 
