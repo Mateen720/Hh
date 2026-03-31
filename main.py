@@ -587,15 +587,17 @@ def dedust_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str, pool_addr
         })
     return buys
 
-def blum_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
-    """Best-effort Blum bonding buy extraction from TonAPI account events.
+def blum_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str, watch_addr: str = "") -> List[Dict[str, Any]]:
+    """Best-effort bonding / memepad buy extraction from TonAPI account events.
 
-    During Blum bonding there is often no STON/DeDust pool yet, so we watch recent
-    TonAPI events on the token address itself and correlate:
-      - JettonTransfer of this jetton to a buyer wallet
-      - TON spent by the same wallet in the same event (TonTransfer or SmartContractExec)
+    Groypad-style launches often look like:
+      - wallet calls launch/router contract with attached TON (opcode 0xa5a7cbf8)
+      - launch/router contract sends jettons to the buyer
+      - a small TON excess comes back to the buyer
 
-    This is intentionally conservative: it only emits BUY-like events.
+    TonAPI sometimes exposes this as actions only, without a normal DEX swap object, so
+    we correlate JettonTransfer + outgoing TON / SmartContractExec and also allow the
+    watched launch contract as the transfer sender.
     """
     if not isinstance(ev, dict):
         return []
@@ -613,7 +615,7 @@ def blum_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> 
 
     def _addr(v: Any) -> str:
         if isinstance(v, dict):
-            return str(v.get("address") or v.get("account") or "").strip()
+            return str(v.get("address") or v.get("account") or v.get("wallet") or "").strip()
         return str(v or "").strip()
 
     def _amt(raw: Any, decimals: int = 9) -> float:
@@ -633,7 +635,10 @@ def blum_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> 
     except Exception:
         token_decimals = 9
 
-    # candidate jetton transfers to end-user recipients
+    allowed_senders = {token_addr}
+    if watch_addr:
+        allowed_senders.add(watch_addr)
+
     candidates: List[Tuple[str, float]] = []
     for a in actions:
         if not isinstance(a, dict) or a.get("type") != "JettonTransfer":
@@ -648,6 +653,9 @@ def blum_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> 
         recipient = _addr(jt.get("recipient"))
         sender = _addr(jt.get("sender"))
         if not recipient or recipient == token_addr or recipient == sender:
+            continue
+        if sender and sender not in allowed_senders and watch_addr:
+            # Ignore random redistribution transfers when we know the launch/router.
             continue
         dec = token_decimals
         try:
@@ -680,20 +688,23 @@ def blum_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> 
         outgoing_by[sender_addr] = max(outgoing_by.get(sender_addr, 0.0), ton_amt)
         incoming_by[recip_addr] = max(incoming_by.get(recip_addr, 0.0), ton_amt)
 
-    if not ton_spent_by:
-        ton_spent_by.update(outgoing_by)
+    ton_spent_by.update(outgoing_by)
 
-    # fallback to ton_attached by executor for wallet-originated calls
     for a in actions:
         if not isinstance(a, dict) or a.get("type") != "SmartContractExec":
             continue
         sc = a.get("SmartContractExec")
         if not isinstance(sc, dict):
             continue
-        ex_addr = _addr(sc.get("executor"))
-        ton_attached = _amt(sc.get("ton_attached") or sc.get("tonAttached"), 9)
+        ex_addr = _addr(sc.get("executor")) or _addr(sc.get("sender"))
+        ton_attached = _amt(sc.get("ton_attached") or sc.get("tonAttached") or sc.get("amount"), 9)
+        opcode = str(sc.get("opcode") or sc.get("op_code") or sc.get("opCode") or "").lower()
         if ex_addr and ton_attached > 0:
             ton_spent_by[ex_addr] = max(ton_spent_by.get(ex_addr, 0.0), ton_attached)
+        # Launchpad wallet->router buy call, often opcode 0xa5a7cbf8.
+        sender_addr = _addr(sc.get("sender")) or ex_addr
+        if sender_addr and ton_attached > 0 and (opcode == "0xa5a7cbf8" or watch_addr):
+            ton_spent_by[sender_addr] = max(ton_spent_by.get(sender_addr, 0.0), ton_attached)
 
     buys: List[Dict[str, Any]] = []
     seen_buyers = set()
@@ -701,9 +712,7 @@ def blum_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> 
         if buyer_addr in seen_buyers:
             continue
         seen_buyers.add(buyer_addr)
-        ton_amount = ton_spent_by.get(buyer_addr, 0.0)
-        # If TonAPI rendered TON transfer only as an incoming refund/excess pattern,
-        # avoid false positives by requiring a positive outgoing/attached amount.
+        ton_amount = ton_spent_by.get(buyer_addr, 0.0) or incoming_by.get(buyer_addr, 0.0)
         if ton_amount <= 0:
             continue
         buys.append({
@@ -4668,7 +4677,7 @@ async def poll_once(app: Application):
                             new_events.append(ev)
 
                         for ev in reversed(new_events):
-                            buys = blum_extract_buys_from_tonapi_event(ev, token["address"])
+                            buys = blum_extract_buys_from_tonapi_event(ev, token["address"], watch_addr)
                             posted_here = []
                             for b in buys:
                                 ton_amt = float(b.get("ton") or 0.0)
@@ -4755,8 +4764,10 @@ async def poll_once(app: Application):
                         txh_new = str(_tx_hash(newest_tx) or "").strip()
                         lt_new = str(newest_tx.get("lt") or "").strip()
                         if txh_new:
+                            token[f"last_blum_tx::{watch_addr}"] = txh_new
                             token["last_blum_tx"] = txh_new
                         if lt_new:
+                            token[f"last_blum_lt::{watch_addr}"] = lt_new
                             token["last_blum_lt"] = lt_new
 
                 save_groups()
