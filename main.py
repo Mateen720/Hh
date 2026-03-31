@@ -2707,9 +2707,9 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        "blum_mode": bool((not ston_pool) and (not dedust_pool)),
-        "launchpad": ("groypad" if (not ston_pool and not dedust_pool) else ""),
-        "launchpad_watch": (GROYPAD_WATCH_BY_TOKEN.get(jetton, "") if (not ston_pool and not dedust_pool) else ""),
+        "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
+        "launchpad": ("groypad" if (bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")) or (not ston_pool and not dedust_pool)) else ""),
+        "launchpad_watch": GROYPAD_WATCH_BY_TOKEN.get(jetton, ""),
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
         "blum_progress_pct": 0.0,
@@ -4162,9 +4162,9 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        "blum_mode": bool((not ston_pool) and (not dedust_pool)),
-        "launchpad": ("groypad" if (not ston_pool and not dedust_pool) else ""),
-        "launchpad_watch": (GROYPAD_WATCH_BY_TOKEN.get(jetton, "") if (not ston_pool and not dedust_pool) else ""),
+        "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
+        "launchpad": ("groypad" if (bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")) or (not ston_pool and not dedust_pool)) else ""),
+        "launchpad_watch": GROYPAD_WATCH_BY_TOKEN.get(jetton, ""),
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
         "blum_progress_pct": 0.0,
@@ -4585,9 +4585,14 @@ async def poll_once(app: Application):
 
         # Blum bonding fallback (no STON/DeDust pool yet)
         try:
-            token["blum_mode"] = bool(token.get("blum_mode") or ((not token.get("ston_pool")) and (not token.get("dedust_pool"))))
+            token["blum_mode"] = bool(
+                token.get("blum_mode")
+                or token.get("launchpad_watch")
+                or (str(token.get("launchpad") or "").lower() == "groypad")
+                or ((not token.get("ston_pool")) and (not token.get("dedust_pool")))
+            )
         except Exception:
-            token["blum_mode"] = bool(token.get("blum_mode"))
+            token["blum_mode"] = bool(token.get("blum_mode")) or bool(token.get("launchpad_watch"))
         if bool(token.get("blum_mode")) and token.get("address"):
             try:
                 ignore_before = int(token.get("ignore_before_ts") or 0)
