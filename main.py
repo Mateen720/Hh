@@ -80,6 +80,12 @@ BLUM_TX_LIMIT = max(20, int(float(os.getenv("BLUM_TX_LIMIT", "80"))))
 GROYPAD_WATCH_BY_TOKEN: Dict[str, str] = {
     "EQAOQNg9yr0xNNR45Ebm3Sa2f3Wo5-blxlUGKZhI_b2OLF5d": "EQA0E6xq3nxkM_DF5m2E_U1WlvLFcG9H7k6ptUbcCIuYOrM9",
 }
+# Router / launch contracts observed across Groypad launches.
+# These are safe to poll generically because the parser still requires the right jetton address
+# before a buy is posted.
+GROYPAD_COMMON_WATCHES: List[str] = [
+    "EQA0E6xq3nxkM_DF5m2E_U1WlvLFcG9H7k6ptUbcCIuYOrM9",
+]
 
 def groypad_watch_address(token_addr: str) -> str:
     return str(GROYPAD_WATCH_BY_TOKEN.get(str(token_addr or "").strip()) or "").strip()
@@ -1737,15 +1743,24 @@ def guess_memepad_watch_addresses(jetton: str) -> List[str]:
     addrs: List[str] = []
     try:
         known = groypad_watch_address(jetton)
-        if known:
+        if known and known not in addrs:
             addrs.append(known)
+    except Exception:
+        pass
+    # Common Groypad router contracts are shared across many launches. Poll them for every
+    # memepad-capable token and let the downstream parser filter by the exact jetton address.
+    try:
+        for a in GROYPAD_COMMON_WATCHES:
+            a = str(a or '').strip()
+            if a and a not in addrs and a != jetton:
+                addrs.append(a)
     except Exception:
         pass
     try:
         for a in tonapi_jetton_top_holders(jetton, 8):
             if a and a not in addrs and a != jetton:
                 addrs.append(a)
-            if len(addrs) >= 4:
+            if len(addrs) >= 8:
                 break
     except Exception:
         pass
