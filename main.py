@@ -1382,6 +1382,7 @@ def get_jetton_meta(jetton: str, ttl: int = 3600) -> dict:
         'symbol': str(info.get('symbol') or '').strip(),
         'decimals': int(info.get('decimals') or 9) if str(info.get('decimals') or '').strip().isdigit() else (info.get('decimals') or 9),
         'holders_count': info.get('holders_count'),
+        'total_supply': info.get('total_supply'),
     }
     # harden decimals
     try:
@@ -1658,6 +1659,32 @@ def tonapi_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Di
     js = tonapi_get_raw(url, params=params)
     return js if isinstance(js, dict) else None
 
+def _jetton_supply_to_float(raw: Any, decimals: int) -> Optional[float]:
+    try:
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            for k in ("amount", "value", "total", "supply", "total_supply"):
+                if raw.get(k) is not None:
+                    raw = raw.get(k)
+                    break
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if not raw:
+                return None
+        v = float(raw)
+        if v <= 0:
+            return None
+        # TonAPI commonly returns total supply in minimal units.
+        # If the value is already human-readable, dividing would make it tiny,
+        # so only divide when it is clearly larger than a normal token supply.
+        if decimals > 0 and v >= (10 ** max(3, decimals)):
+            v = v / (10 ** decimals)
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
 def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
     """Fetch basic jetton metadata from TonAPI.
 
@@ -1665,10 +1692,11 @@ def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
       - name, symbol
       - decimals (int, default 9)
       - holders_count (best-effort)
+      - total_supply (best-effort, token units)
 
     Note: Some DEX endpoints return amounts in minimal units, so decimals are critical.
     """
-    out: Dict[str, Any] = {"name": "", "symbol": "", "decimals": 9, "holders_count": None}
+    out: Dict[str, Any] = {"name": "", "symbol": "", "decimals": 9, "holders_count": None, "total_supply": None}
     js = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton}")
     if not js:
         return out
@@ -1701,6 +1729,27 @@ def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
             if isinstance(hc, str) and hc.isdigit():
                 out["holders_count"] = int(hc)
                 break
+    except Exception:
+        pass
+
+    # total supply (best-effort)
+    try:
+        supply_raw = None
+        for k in (
+            "total_supply", "totalSupply", "supply", "jetton_supply", "jettonSupply",
+            "mintable_total_supply", "max_supply", "maxSupply", "circulating_supply",
+        ):
+            if js.get(k) is not None:
+                supply_raw = js.get(k)
+                break
+        if supply_raw is None and isinstance(meta, dict):
+            for k in (
+                "total_supply", "totalSupply", "supply", "max_supply", "circulating_supply",
+            ):
+                if meta.get(k) is not None:
+                    supply_raw = meta.get(k)
+                    break
+        out["total_supply"] = _jetton_supply_to_float(supply_raw, int(out.get("decimals") or 9))
     except Exception:
         pass
 
@@ -2718,6 +2767,7 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "symbol": sym,
         "decimals": int(decimals_seed) if str(decimals_seed).isdigit() else 9,
         "holders": holders_seed,
+        "total_supply": info_h.get("total_supply") if 'info_h' in locals() and isinstance(info_h, dict) else None,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
@@ -4173,6 +4223,7 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "symbol": sym,
         "decimals": int(decimals_seed) if str(decimals_seed).isdigit() else 9,
         "holders": holders_seed,
+        "total_supply": info_h.get("total_supply") if 'info_h' in locals() and isinstance(info_h, dict) else None,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
@@ -4813,6 +4864,46 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 mv = _to_float(tinfo.get("market_cap_usd"))
                 if mv is not None:
                     mc_usd = mv
+
+    # Bonding / Groypad fallback: when no live pool exists yet, derive best-effort
+    # stats from the current buy + TonAPI jetton supply instead of showing dashes.
+    if bool(token.get("blum_mode")) and (price_usd is None or liq_usd is None or mc_usd is None):
+        supply_tokens = _to_float(token.get("total_supply"))
+        if supply_tokens is None and jetton_addr:
+            try:
+                jmeta = get_jetton_meta(jetton_addr)
+                sv = _to_float(jmeta.get("total_supply"))
+                if sv is not None:
+                    supply_tokens = sv
+                    token["total_supply"] = sv
+            except Exception:
+                pass
+        ton_usd = ton_usd_price()
+        try:
+            ton_spent_now = float(b.get("ton") or 0.0)
+        except Exception:
+            ton_spent_now = 0.0
+        try:
+            token_amount_now = float(b.get("token_amount") or 0.0)
+        except Exception:
+            token_amount_now = 0.0
+        if price_usd is None and ton_usd and ton_usd > 0 and ton_spent_now > 0 and token_amount_now > 0:
+            est_price = (ton_spent_now / token_amount_now) * ton_usd
+            if est_price > 0:
+                price_usd = est_price
+        if liq_usd is None and ton_usd and ton_usd > 0:
+            try:
+                bonded_ton = float(token.get("blum_progress_ton") or 0.0)
+            except Exception:
+                bonded_ton = 0.0
+            if bonded_ton > 0:
+                est_liq = bonded_ton * ton_usd
+                if est_liq > 0:
+                    liq_usd = est_liq
+        if mc_usd is None and price_usd is not None and supply_tokens is not None and supply_tokens > 0:
+            est_mc = price_usd * supply_tokens
+            if est_mc > 0:
+                mc_usd = est_mc
 
     # Holders (keep last known value if APIs fail)
     holders = None
