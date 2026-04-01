@@ -1665,10 +1665,11 @@ def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
       - name, symbol
       - decimals (int, default 9)
       - holders_count (best-effort)
+      - total_supply (human units when detectable)
 
     Note: Some DEX endpoints return amounts in minimal units, so decimals are critical.
     """
-    out: Dict[str, Any] = {"name": "", "symbol": "", "decimals": 9, "holders_count": None}
+    out: Dict[str, Any] = {"name": "", "symbol": "", "decimals": 9, "holders_count": None, "total_supply": None}
     js = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton}")
     if not js:
         return out
@@ -1701,6 +1702,32 @@ def tonapi_jetton_info(jetton: str) -> Dict[str, Any]:
             if isinstance(hc, str) and hc.isdigit():
                 out["holders_count"] = int(hc)
                 break
+    except Exception:
+        pass
+
+    # total supply (best-effort). TonAPI may expose it under different keys and
+    # sometimes in minimal units, so convert using decimals when sensible.
+    try:
+        raw_supply = None
+        for k in ("total_supply", "totalSupply", "supply", "jetton_supply"):
+            v = js.get(k)
+            if v not in (None, ""):
+                raw_supply = v
+                break
+        if raw_supply is None and isinstance(meta, dict):
+            for k in ("total_supply", "totalSupply", "supply"):
+                v = meta.get(k)
+                if v not in (None, ""):
+                    raw_supply = v
+                    break
+        if raw_supply is not None:
+            sf = float(str(raw_supply).strip())
+            decv = int(out.get("decimals") or 9)
+            if sf > 0:
+                # Heuristic: if the number is huge, it is likely in minimal units.
+                if decv > 0 and sf >= (10 ** decv):
+                    sf = sf / float(10 ** decv)
+                out["total_supply"] = sf
     except Exception:
         pass
 
@@ -1933,6 +1960,74 @@ def gecko_pool_info(pool_addr: str) -> Optional[dict]:
 
 def gecko_terminal_pool_url(pool_addr: str) -> str:
     return f"https://www.geckoterminal.com/ton/pools/{pool_addr}"
+
+def estimate_bonding_market_stats(token: Dict[str, Any], ton_amt: Any, tok_amt: Any,
+                                  price_usd: Optional[float], liq_usd: Optional[float],
+                                  mc_usd: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Best-effort fallback stats for bonding / launchpad tokens before pool stats exist.
+
+    This is only used when normal pool/token APIs do not provide values, so it won't
+    override working live market stats. It keeps Groypad/Groypi bonding cards from
+    showing blank price/liquidity/market-cap while buys are already posting fine.
+    """
+    try:
+        is_bonding = bool(token.get("blum_mode")) or str(token.get("launchpad") or "").lower() in ("groypad", "groypi", "blum")
+    except Exception:
+        is_bonding = False
+    if not is_bonding:
+        return price_usd, liq_usd, mc_usd
+
+    def _f(v):
+        try:
+            fv = float(v)
+            return fv if fv > 0 else None
+        except Exception:
+            return None
+
+    price_usd = _f(price_usd)
+    liq_usd = _f(liq_usd)
+    mc_usd = _f(mc_usd)
+
+    ton_f = _f(ton_amt)
+    tok_f = _f(tok_amt)
+
+    # Approximate execution price from the live bonding buy when no market API exists yet.
+    if price_usd is None and ton_f and tok_f:
+        try:
+            pton = ton_usd_price()
+            if pton and pton > 0:
+                price_usd = (ton_f / tok_f) * float(pton)
+        except Exception:
+            pass
+
+    # Bonding progress TON is the best available proxy for current launch liquidity.
+    if liq_usd is None:
+        try:
+            prog_ton = float(token.get("blum_progress_ton") or 0.0)
+            pton = ton_usd_price()
+            if prog_ton > 0 and pton and pton > 0:
+                liq_usd = prog_ton * float(pton)
+        except Exception:
+            pass
+
+    # Market cap from price * supply when TonAPI exposes supply.
+    if mc_usd is None and price_usd is not None:
+        supply = _f(token.get("total_supply"))
+        if supply is None:
+            try:
+                info = tonapi_jetton_info(str(token.get("address") or "").strip())
+                supply = _f(info.get("total_supply"))
+                if supply is not None:
+                    token["total_supply"] = supply
+            except Exception:
+                supply = None
+        if supply is not None:
+            try:
+                mc_usd = float(price_usd) * float(supply)
+            except Exception:
+                pass
+
+    return price_usd, liq_usd, mc_usd
 
 def find_pair_for_token_on_dex(token_address: str, want_dex: str) -> Optional[str]:
     url = f"{DEX_TOKEN_URL}/{token_address}"
@@ -2682,13 +2777,18 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sym_hint:
         sym = sym_hint
 
-    # Seed holders and decimals
+    # Seed holders / decimals / supply
     holders_seed: Optional[int] = None
+    total_supply_seed: Optional[float] = None
+    total_supply_seed: Optional[float] = None
     try:
         info_h = tonapi_jetton_info(jetton)
         hh = info_h.get("holders_count")
         if hh is not None:
             holders_seed = int(hh)
+        ts = info_h.get("total_supply")
+        if ts is not None:
+            total_supply_seed = float(ts)
     except Exception:
         pass
     if holders_seed is None:
@@ -2718,6 +2818,7 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "symbol": sym,
         "decimals": int(decimals_seed) if str(decimals_seed).isdigit() else 9,
         "holders": holders_seed,
+        "total_supply": total_supply_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
@@ -4173,6 +4274,7 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "symbol": sym,
         "decimals": int(decimals_seed) if str(decimals_seed).isdigit() else 9,
         "holders": holders_seed,
+        "total_supply": total_supply_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
@@ -4813,6 +4915,9 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 mv = _to_float(tinfo.get("market_cap_usd"))
                 if mv is not None:
                     mc_usd = mv
+
+    # Bonding / launchpad fallback: only fill blanks, never override live pool stats.
+    price_usd, liq_usd, mc_usd = estimate_bonding_market_stats(token, ton_amt, tok_amt, price_usd, liq_usd, mc_usd)
 
     # Holders (keep last known value if APIs fail)
     holders = None
