@@ -5128,8 +5128,22 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     name = (token.get("name") or "").strip()
     title = sym or name or "TOKEN"
 
+    def _to_float_any(x):
+        try:
+            if x is None:
+                return None
+            if isinstance(x, (int, float)):
+                return float(x)
+            s = str(x).strip().replace(',', '')
+            if not s:
+                return None
+            return float(s)
+        except Exception:
+            return None
+
     ton_amt = float(b.get("ton") or 0.0)
     tok_amt = b.get("token_amount")
+    tok_amt_f = _to_float_any(tok_amt)
     tok_symbol = b.get("token_symbol") or sym or ""
 
     # Record for Top-10 leaderboard (rolling window)
@@ -5248,18 +5262,42 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         except Exception:
             pass
 
+    # Bonding / launchpad tokens often have no public pool yet.
+    # Keep a lightweight observed progress so Groypi/Blum/GASPUMP can still show
+    # price/liquidity/market-cap without affecting normal buy flow.
+    _lp_name = str(token.get("launchpad") or "").strip().lower()
+    _is_bonding = bool(token.get("blum_mode")) or _lp_name in ("blum", "gaspump", "groypi", "groypad")
+    if _is_bonding:
+        try:
+            cur_prog = float(token.get("blum_progress_ton") or 0.0)
+        except Exception:
+            cur_prog = 0.0
+        if ton_amt > 0 and (cur_prog <= 0 or cur_prog < ton_amt):
+            try:
+                cap = max(1.0, float(token.get("blum_cap_ton") or BLUM_BONDING_CAP_TON or 1500.0))
+            except Exception:
+                cap = 1500.0
+            cur_prog = min(cap, max(cur_prog, 0.0) + float(ton_amt))
+            token["blum_progress_ton"] = round(cur_prog, 6)
+            try:
+                token["blum_progress_pct"] = round((cur_prog / cap) * 100.0, 2)
+            except Exception:
+                pass
+
     ton_usd = ton_usd_price()
     if ton_usd and ton_usd > 0:
         try:
-            if (price_usd is None) and ton_amt > 0 and tok_amt and float(tok_amt) > 0:
-                price_usd = (float(ton_amt) * float(ton_usd)) / float(tok_amt)
+            if price_usd is None and ton_amt > 0 and tok_amt_f and tok_amt_f > 0:
+                price_usd = (float(ton_amt) * float(ton_usd)) / float(tok_amt_f)
         except Exception:
             pass
         try:
             if liq_usd is None:
-                prog_ton = float(token.get("blum_progress_ton") or 0.0)
+                prog_ton = _to_float_any(token.get("blum_progress_ton")) or 0.0
                 if prog_ton > 0:
                     liq_usd = prog_ton * float(ton_usd)
+                elif _is_bonding and ton_amt > 0:
+                    liq_usd = float(ton_amt) * float(ton_usd)
         except Exception:
             pass
         try:
