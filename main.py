@@ -73,6 +73,9 @@ GECKO_BASE = os.getenv("GECKO_BASE", "https://api.geckoterminal.com/api/v2").str
 BLUM_BONDING_CAP_TON = float(os.getenv("BLUM_BONDING_CAP_TON", "1500").strip() or 1500)
 BLUM_EVENT_LIMIT = max(20, int(float(os.getenv("BLUM_EVENT_LIMIT", "80"))))
 BLUM_TX_LIMIT = max(20, int(float(os.getenv("BLUM_TX_LIMIT", "80"))))
+LAUNCHPAD_DISCOVERY_LIMIT = max(12, int(float(os.getenv("LAUNCHPAD_DISCOVERY_LIMIT", "24"))))
+LAUNCHPAD_DISCOVERY_HOLDER_LIMIT = max(6, int(float(os.getenv("LAUNCHPAD_DISCOVERY_HOLDER_LIMIT", "12"))))
+LAUNCHPAD_DISCOVERY_REFRESH_SEC = max(60, int(float(os.getenv("LAUNCHPAD_DISCOVERY_REFRESH_SEC", "600"))))
 
 
 def _load_addr_map_env(name: str) -> Dict[str, str]:
@@ -86,10 +89,11 @@ def _load_addr_map_env(name: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if isinstance(data, dict):
         for k, v in data.items():
-            kk = str(k or "").strip()
-            vv = str(v or "").strip()
+            kk = _norm_addr(k)
+            vv = _norm_addr(v)
             if kk and vv:
                 out[kk] = vv
+                out[str(k or "").strip()] = vv
     return out
 
 BLUM_WATCH_BY_TOKEN = _load_addr_map_env("BLUM_WATCH_BY_TOKEN")
@@ -112,6 +116,15 @@ def ensure_ton_amount(v: float) -> float:
     if x > 1e6:
         return x / NANO
     return x
+
+
+def _norm_addr(v: Any) -> str:
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    if s.startswith("0:"):
+        s = s[2:]
+    return s
 
 
 USER_PREFS_FILE = _data_path(os.getenv("USER_PREFS_FILE", "user_prefs_public.json"))
@@ -966,7 +979,142 @@ def launchpad_watch_address(token: Dict[str, Any]) -> str:
     return addrs[0] if addrs else str((token or {}).get("address") or "").strip()
 
 
-def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
+def infer_launchpad_routes_for_token(token_addr: str, seed_addresses: Optional[List[str]] = None, tx_limit: int = LAUNCHPAD_DISCOVERY_LIMIT) -> Tuple[str, List[str], List[str]]:
+    token_addr = _norm_addr(token_addr)
+    if not token_addr:
+        return "", [], []
+
+    seeds: List[str] = []
+    seen: set[str] = set()
+
+    def _add_seed(v: Any):
+        a = _norm_addr(v)
+        if a and a not in seen:
+            seen.add(a)
+            seeds.append(a)
+
+    _add_seed(token_addr)
+    if isinstance(seed_addresses, list):
+        for a in seed_addresses:
+            _add_seed(a)
+    for a in tonapi_jetton_holder_addresses(token_addr, LAUNCHPAD_DISCOVERY_HOLDER_LIMIT):
+        _add_seed(a)
+
+    found_name = ""
+    watch_addrs: List[str] = []
+    seen_watch: set[str] = set()
+    opcodes: List[str] = []
+    seen_op: set[str] = set()
+
+    def _add_watch(a: Any):
+        aa = _norm_addr(a)
+        if aa and aa not in seen_watch and aa != token_addr:
+            seen_watch.add(aa)
+            watch_addrs.append(aa)
+
+    def _add_op(op: Any):
+        sop = _norm_opcode_value(op)
+        if sop and sop not in seen_op:
+            seen_op.add(sop)
+            opcodes.append(sop)
+
+    for addr in seeds:
+        try:
+            txs = tonapi_account_transactions(addr, tx_limit)
+        except Exception:
+            continue
+        if not isinstance(txs, list):
+            continue
+        for tx in txs:
+            if not isinstance(tx, dict):
+                continue
+            in_msg = tx.get("in_msg") or tx.get("inMsg") or tx.get("inMessage") or {}
+            if not isinstance(in_msg, dict):
+                continue
+            in_op = _msg_opcode(in_msg)
+            try:
+                in_blob = json.dumps((in_msg.get("decoded_body") or in_msg.get("decodedBody") or in_msg.get("body") or {}), ensure_ascii=False).lower() if isinstance(in_msg, dict) else ""
+            except Exception:
+                in_blob = ""
+            lp = detect_launchpad_from_opcode(in_op, in_blob)
+            if not lp:
+                continue
+            buys = blum_extract_buys_from_tonapi_tx(tx, token_addr)
+            if not buys:
+                continue
+            dest = _msg_addr_deep((in_msg.get("destination") if isinstance(in_msg, dict) else None) or (in_msg.get("dest") if isinstance(in_msg, dict) else None) or (in_msg.get("dst") if isinstance(in_msg, dict) else None) or in_msg)
+            if dest:
+                _add_watch(dest)
+            _add_op(in_op)
+            if not found_name:
+                found_name = lp
+
+    return found_name, watch_addrs, opcodes
+
+
+def refresh_launchpad_config(token: Dict[str, Any], force: bool = False) -> bool:
+    if not isinstance(token, dict):
+        return False
+    token_addr = _norm_addr(token.get("address"))
+    if not token_addr:
+        return False
+    now = int(time.time())
+    try:
+        last = int(token.get("launchpad_discovery_ts") or 0)
+    except Exception:
+        last = 0
+    if (not force) and last and (now - last) < LAUNCHPAD_DISCOVERY_REFRESH_SEC:
+        return False
+
+    seeds = []
+    for a in (token.get("launchpad_watch_addresses") or []):
+        seeds.append(a)
+    for a in (token.get("watch_addresses") or []):
+        seeds.append(a)
+    for a in [token.get("launchpad_watch"), token.get("watch_address")]:
+        if a:
+            seeds.append(a)
+
+    lp_name, inferred_watches, inferred_ops = infer_launchpad_routes_for_token(token_addr, seeds)
+    changed = False
+
+    existing = token.get("launchpad_watch_addresses") or []
+    if isinstance(existing, str):
+        existing = [existing]
+    merged: List[str] = []
+    seen_m: set[str] = set()
+    for a in list(existing) + inferred_watches:
+        aa = _norm_addr(a)
+        if aa and aa not in seen_m:
+            seen_m.add(aa)
+            merged.append(aa)
+
+    if merged != list(existing):
+        token["launchpad_watch_addresses"] = merged
+        changed = True
+    if merged:
+        first = merged[0]
+        if _norm_addr(token.get("launchpad_watch")) != first:
+            token["launchpad_watch"] = first
+            changed = True
+    if lp_name and str(token.get("launchpad") or "").strip().lower() != lp_name:
+        token["launchpad"] = lp_name
+        changed = True
+    if inferred_ops:
+        first_op = inferred_ops[0]
+        if str(token.get("launchpad_opcode") or "").strip().lower() != first_op:
+            token["launchpad_opcode"] = first_op
+            changed = True
+    if lp_name or merged:
+        if not bool(token.get("blum_mode")):
+            token["blum_mode"] = True
+            changed = True
+
+    token["launchpad_discovery_ts"] = now
+    return changed
+
+
+def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str, expected_watch: str = "", expected_opcode: str = "") -> List[Dict[str, Any]]:
     """Raw TonAPI blockchain transaction fallback for bonding / launchpad buys.
 
     This covers the earlier Blum-style bonding flow and Groypad-like launchpad buys
@@ -1000,6 +1148,7 @@ def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> Lis
         out_msgs = []
 
     buyer = _msg_addr_deep((in_msg.get("source") if isinstance(in_msg, dict) else None) or (in_msg.get("src") if isinstance(in_msg, dict) else None) or in_msg)
+    in_dest = _msg_addr_deep((in_msg.get("destination") if isinstance(in_msg, dict) else None) or (in_msg.get("dest") if isinstance(in_msg, dict) else None) or (in_msg.get("dst") if isinstance(in_msg, dict) else None) or in_msg)
     ton_in = _msg_value_ton(in_msg)
     in_op = _msg_opcode(in_msg)
     try:
@@ -1008,6 +1157,12 @@ def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> Lis
         in_blob = ""
     detected_launchpad = detect_launchpad_from_opcode(in_op, in_blob)
     launchpad_like_in = bool(detected_launchpad) or any(x in (in_op or "") for x in LAUNCHPAD_BUY_OPS) or any(x in in_blob for x in LAUNCHPAD_BUY_OPS)
+    exp_watch = _norm_addr(expected_watch)
+    exp_op = _norm_opcode_value(expected_opcode)
+    if exp_watch and _norm_addr(in_dest) and _norm_addr(in_dest) != exp_watch:
+        return []
+    if exp_op and in_op and _norm_opcode_value(in_op) != exp_op:
+        return []
     if (not launchpad_like_in) and ton_in > 0 and tx_hash and ("groypad" in in_blob or "groyp" in in_blob or "dtrade" in in_blob):
         launchpad_like_in = True
         if not detected_launchpad:
@@ -2862,6 +3017,8 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "launchpad": (_lp_name if (_lp_name or ((not ston_pool) and (not dedust_pool))) else ""),
             "launchpad_watch": (_lp_watches[0] if _lp_watches else ""),
             "launchpad_watch_addresses": (_lp_watches + tonapi_jetton_holder_addresses(jetton, 8)),
+            "launchpad_opcode": "",
+            "launchpad_discovery_ts": 0,
         })(*launchpad_maps_for_token(jetton)),
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
@@ -2880,6 +3037,14 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "burst": {"window_start": int(time.time()), "count": 0},
         "telegram": tg_url.strip() if tg_url else "",
     }
+    try:
+        refresh_launchpad_config(tok, force=True)
+    except Exception as _e:
+        log.debug("initial launchpad discovery err %s", _e)
+    try:
+        refresh_launchpad_config(tok, force=True)
+    except Exception as _e:
+        log.debug("initial launchpad discovery err %s", _e)
     GLOBAL_TOKENS[str(jetton)] = tok
     save_groups()  # also saves GLOBAL_TOKENS
 
@@ -4320,6 +4485,8 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
             "launchpad": (_lp_name if (_lp_name or ((not ston_pool) and (not dedust_pool))) else ""),
             "launchpad_watch": (_lp_watches[0] if _lp_watches else ""),
             "launchpad_watch_addresses": (_lp_watches + tonapi_jetton_holder_addresses(jetton, 8)),
+            "launchpad_opcode": "",
+            "launchpad_discovery_ts": 0,
         })(*launchpad_maps_for_token(jetton)),
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
@@ -4753,6 +4920,13 @@ async def poll_once(app: Application):
             try:
                 ignore_before = int(token.get("ignore_before_ts") or 0)
 
+                # Refresh launchpad routing so memepad buys are not missed when each token has a different watch contract.
+                try:
+                    if refresh_launchpad_config(token):
+                        save_groups()
+                except Exception as _e:
+                    log.debug("launchpad discovery err chat=%s %s", chat_id, _e)
+
                 # 1) TonAPI events pass (watch multiple candidate addresses for memepad launches)
                 watch_addrs = launchpad_watch_addresses(token)
                 last_eid_map = token.get("last_blum_event_by_watch") or {}
@@ -4872,7 +5046,12 @@ async def poll_once(app: Application):
                         new_txs.append(txo)
 
                     for txo in reversed(new_txs):
-                        buys = blum_extract_buys_from_tonapi_tx(txo, token["address"])
+                        buys = blum_extract_buys_from_tonapi_tx(
+                            txo,
+                            token["address"],
+                            expected_watch=(watch_addr if watch_addr != token.get("address") else (token.get("launchpad_watch") or "")),
+                            expected_opcode=token.get("launchpad_opcode") or "",
+                        )
                         posted_here = []
                         for b in buys:
                             if (not str(token.get("launchpad") or "").strip()) and str(b.get("launchpad") or "").strip():
