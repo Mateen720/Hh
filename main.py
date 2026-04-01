@@ -74,6 +74,29 @@ BLUM_BONDING_CAP_TON = float(os.getenv("BLUM_BONDING_CAP_TON", "1500").strip() o
 BLUM_EVENT_LIMIT = max(20, int(float(os.getenv("BLUM_EVENT_LIMIT", "80"))))
 BLUM_TX_LIMIT = max(20, int(float(os.getenv("BLUM_TX_LIMIT", "80"))))
 
+
+def _load_addr_map_env(name: str) -> Dict[str, str]:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    out: Dict[str, str] = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            kk = str(k or "").strip()
+            vv = str(v or "").strip()
+            if kk and vv:
+                out[kk] = vv
+    return out
+
+BLUM_WATCH_BY_TOKEN = _load_addr_map_env("BLUM_WATCH_BY_TOKEN")
+GASPUMP_WATCH_BY_TOKEN = _load_addr_map_env("GASPUMP_WATCH_BY_TOKEN")
+GROYPI_WATCH_BY_TOKEN = _load_addr_map_env("GROYPI_WATCH_BY_TOKEN")
+GROYPAD_WATCH_BY_TOKEN = _load_addr_map_env("GROYPAD_WATCH_BY_TOKEN")
+
 DATA_FILE = _data_path(os.getenv("GROUPS_FILE", "groups_public.json"))
 SEEN_FILE = _data_path(os.getenv("SEEN_FILE", "seen_public.json"))
 # -------------------- AMOUNT HELPERS --------------------
@@ -821,19 +844,88 @@ def _msg_body_amount(msg: Any, decimals: int = 9) -> float:
         return 0.0
 
 LAUNCHPAD_BUY_OPS = {
-    "0xa5a7cbf8",  # observed on Groypad/DTrade-style launchpad buy calls
-    "0xa5a7cbf8",
+    "0xaf750d34",  # Blum memepad buy call
+    "af750d34",
+    "0x6cd3e4b0",  # GASPUMP memepad buy call
+    "6cd3e4b0",
+    "0xa5a7cbf8",  # Groypi / Groypad style launchpad buy call
     "a5a7cbf8",
 }
 
-# Best-effort Groypad watch-address map.
-# Important: launchpad buys often hit a router/launchpad contract, not the jetton master itself,
-# so polling the token master account can miss them entirely. When we know the launchpad contract
-# from a sample tx, we watch that contract instead.
-GROYPAD_WATCH_BY_TOKEN = {
-    # IGOR sample supplied by user on 2026-03-30
-    "EQAOQNg9yr0xNNR45Ebm3Sa2f3Wo5-blxlUGKZhI_b2OLF5d": "0:71f1326c1bd3a07e938982e54711ed2ce56b38d1304ce432340f2bc3a404f6a1",
+LAUNCHPAD_OP_TO_NAME = {
+    "0xaf750d34": "blum",
+    "af750d34": "blum",
+    "0x6cd3e4b0": "gaspump",
+    "6cd3e4b0": "gaspump",
+    "0xa5a7cbf8": "groypi",
+    "a5a7cbf8": "groypi",
 }
+
+LAUNCHPAD_LABELS = {
+    "blum": "Blum",
+    "gaspump": "GASPUMP",
+    "groypi": "Groypi",
+    "groypad": "Groypad",
+}
+
+LAUNCHPAD_URLS = {
+    "blum": "https://t.me/blum/app?startapp=memepad",
+    "gaspump": "https://t.me/gasPump_bot/app",
+    "groypi": "https://groypfi.io/launchpad",
+    "groypad": "https://groypfi.io/launchpad",
+}
+
+# Sample watch contracts observed in user-supplied transactions.
+BLUM_WATCH_BY_TOKEN.setdefault("memepadjetton_CHIBIELON_EGG5n", "EQB2JK8Q5WcG9yx2n69QbwF5f95vRMMZxgwjNxkBdu-ubxs")
+GASPUMP_WATCH_BY_TOKEN.setdefault("EQDvIUUX5rL_GmPT3x8fCdENxOKwjfHK9xFpsONJ_UrCMVT7", "EQDvIUUX5rL_GmPT3x8fCdENxOKwjfHK9xFpsONJ_UrCMVT7")
+
+def token_launchpad(token: Dict[str, Any], fallback: str = "") -> str:
+    lp = str((token or {}).get("launchpad") or "").strip().lower()
+    if lp:
+        return lp
+    return str(fallback or "").strip().lower()
+
+def launchpad_label(token: Dict[str, Any], fallback: str = "") -> str:
+    lp = token_launchpad(token, fallback)
+    return LAUNCHPAD_LABELS.get(lp, (fallback or "Blum"))
+
+def launchpad_url_for(token: Dict[str, Any], fallback: str = "") -> str:
+    lp = token_launchpad(token, fallback)
+    return LAUNCHPAD_URLS.get(lp, "")
+
+def detect_launchpad_from_opcode(op: Any, blob: Any = "") -> str:
+    sop = str(op or "").strip().lower()
+    if sop in LAUNCHPAD_OP_TO_NAME:
+        return LAUNCHPAD_OP_TO_NAME[sop]
+    sblob = str(blob or "").lower()
+    for k, v in LAUNCHPAD_OP_TO_NAME.items():
+        if k and k in sblob:
+            return v
+    if "blum" in sblob:
+        return "blum"
+    if "gaspump" in sblob or "gaspump_bot" in sblob:
+        return "gaspump"
+    if "groyp" in sblob or "dtrade" in sblob:
+        return "groypi"
+    return ""
+
+def launchpad_maps_for_token(addr: str) -> Tuple[str, List[str]]:
+    addr = str(addr or "").strip()
+    pairs = [
+        ("blum", BLUM_WATCH_BY_TOKEN),
+        ("gaspump", GASPUMP_WATCH_BY_TOKEN),
+        ("groypi", GROYPI_WATCH_BY_TOKEN),
+        ("groypad", GROYPAD_WATCH_BY_TOKEN),
+    ]
+    watches: List[str] = []
+    name = ""
+    for nm, mp in pairs:
+        val = str(mp.get(addr, "") or "").strip()
+        if val:
+            watches.append(val)
+            if not name:
+                name = nm
+    return name, watches
 
 def launchpad_watch_addresses(token: Dict[str, Any]) -> List[str]:
     if not isinstance(token, dict):
@@ -857,8 +949,12 @@ def launchpad_watch_addresses(token: Dict[str, Any]) -> List[str]:
     _add(token.get("launchpad_watch") or token.get("watch_address"))
 
     addr = str(token.get("address") or "").strip()
-    if str(token.get("launchpad") or "").lower() == "groypad":
-        _add(GROYPAD_WATCH_BY_TOKEN.get(addr))
+    mapped_name, mapped_watches = launchpad_maps_for_token(addr)
+    for a in mapped_watches:
+        _add(a)
+
+    lp = token_launchpad(token, mapped_name)
+    if lp in ("blum", "gaspump", "groypi", "groypad") or bool(token.get("blum_mode")):
         for a in tonapi_jetton_holder_addresses(addr, 8):
             _add(a)
     _add(addr)
@@ -910,9 +1006,12 @@ def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> Lis
         in_blob = json.dumps((in_msg.get("decoded_body") or in_msg.get("decodedBody") or in_msg.get("body") or {}), ensure_ascii=False).lower() if isinstance(in_msg, dict) else ""
     except Exception:
         in_blob = ""
-    launchpad_like_in = any(x in (in_op or "") for x in LAUNCHPAD_BUY_OPS) or any(x in in_blob for x in LAUNCHPAD_BUY_OPS)
-    if (not launchpad_like_in) and ton_in > 0 and tx_hash and ("groypad" in in_blob or "dtrade" in in_blob):
+    detected_launchpad = detect_launchpad_from_opcode(in_op, in_blob)
+    launchpad_like_in = bool(detected_launchpad) or any(x in (in_op or "") for x in LAUNCHPAD_BUY_OPS) or any(x in in_blob for x in LAUNCHPAD_BUY_OPS)
+    if (not launchpad_like_in) and ton_in > 0 and tx_hash and ("groypad" in in_blob or "groyp" in in_blob or "dtrade" in in_blob):
         launchpad_like_in = True
+        if not detected_launchpad:
+            detected_launchpad = "groypi"
 
     candidates = []
     for m in out_msgs:
@@ -963,6 +1062,7 @@ def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> Lis
             "token_amount": token_amount,
             "utime": utime,
             "lt": str(tx.get("lt") or "").strip(),
+            "launchpad": detected_launchpad,
         })
 
     out = []
@@ -2757,10 +2857,12 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
-        "launchpad": ("groypad" if (bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")) or (not ston_pool and not dedust_pool)) else ""),
-        "launchpad_watch": GROYPAD_WATCH_BY_TOKEN.get(jetton, ""),
-        "launchpad_watch_addresses": ([GROYPAD_WATCH_BY_TOKEN.get(jetton, "")] if GROYPAD_WATCH_BY_TOKEN.get(jetton, "") else []) + tonapi_jetton_holder_addresses(jetton, 8),
+        **(lambda _lp_name, _lp_watches: {
+            "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(_lp_watches),
+            "launchpad": (_lp_name if (_lp_name or ((not ston_pool) and (not dedust_pool))) else ""),
+            "launchpad_watch": (_lp_watches[0] if _lp_watches else ""),
+            "launchpad_watch_addresses": (_lp_watches + tonapi_jetton_holder_addresses(jetton, 8)),
+        })(*launchpad_maps_for_token(jetton)),
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
         "blum_progress_pct": 0.0,
@@ -4213,10 +4315,12 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
-        "launchpad": ("groypad" if (bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")) or (not ston_pool and not dedust_pool)) else ""),
-        "launchpad_watch": GROYPAD_WATCH_BY_TOKEN.get(jetton, ""),
-        "launchpad_watch_addresses": ([GROYPAD_WATCH_BY_TOKEN.get(jetton, "")] if GROYPAD_WATCH_BY_TOKEN.get(jetton, "") else []) + tonapi_jetton_holder_addresses(jetton, 8),
+        **(lambda _lp_name, _lp_watches: {
+            "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(_lp_watches),
+            "launchpad": (_lp_name if (_lp_name or ((not ston_pool) and (not dedust_pool))) else ""),
+            "launchpad_watch": (_lp_watches[0] if _lp_watches else ""),
+            "launchpad_watch_addresses": (_lp_watches + tonapi_jetton_holder_addresses(jetton, 8)),
+        })(*launchpad_maps_for_token(jetton)),
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
         "blum_progress_pct": 0.0,
@@ -4711,7 +4815,7 @@ async def poll_once(app: Application):
                                     "buyer": b.get("buyer"),
                                     "ton": ton_amt,
                                     "token_amount": float(b.get("token_amount") or 0.0),
-                                }, source=("Groypad" if str(token.get("launchpad") or "").lower()=="groypad" else "Blum"))
+                                }, source=launchpad_label(token, str((b if isinstance(b, dict) else {}).get("launchpad") or "")))
                                 posted_here.append(b)
                             if posted_here:
                                 blum_progress_from_buys(token, posted_here)
@@ -4771,6 +4875,8 @@ async def poll_once(app: Application):
                         buys = blum_extract_buys_from_tonapi_tx(txo, token["address"])
                         posted_here = []
                         for b in buys:
+                            if (not str(token.get("launchpad") or "").strip()) and str(b.get("launchpad") or "").strip():
+                                token["launchpad"] = str(b.get("launchpad") or "").strip().lower()
                             ton_amt = float(b.get("ton") or 0.0)
                             if ton_amt < min_buy:
                                 continue
@@ -4786,7 +4892,7 @@ async def poll_once(app: Application):
                                 "buyer": b.get("buyer"),
                                 "ton": ton_amt,
                                 "token_amount": float(b.get("token_amount") or 0.0),
-                            }, source=("Groypad" if str(token.get("launchpad") or "").lower()=="groypad" else "Blum"))
+                            }, source=launchpad_label(token, str(b.get("launchpad") or "")))
                             posted_here.append(b)
                         if posted_here:
                             blum_progress_from_buys(token, posted_here)
@@ -5301,7 +5407,12 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 _bcap = float(token.get("blum_cap_ton") or BLUM_BONDING_CAP_TON or 1500.0)
             except Exception:
                 _bcap = 1500.0
-            blocks.append(f'Bonding: <b>{h(f"{_bpct:.1f}%")}</b> ({h(f"{_bton:,.2f}")}/{h(f"{_bcap:,.0f}")} TON)')
+            _lp = launchpad_label(token, str(source or ""))
+            _filled = max(0, min(10, int(_bpct // 10 if _bpct < 100 else 10)))
+            _bar = ("🟦" * _filled) + ("⬜" * (10 - _filled))
+            blocks.append(f'Bonding Buy — <b>{h(_lp)}</b>')
+            blocks.append(f'Target: <b>{h(f"{_bpct:.1f}%")}</b> ({h(f"{_bton:,.2f}")}/{h(f"{_bcap:,.0f}")} TON)')
+            blocks.append(_bar)
         blocks.extend([
             "",
             links_row_local,
@@ -5420,9 +5531,15 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
 
         btn_label_symbol = (tok_symbol or title or "TOKEN").strip().upper()
         btn_label_symbol = re.sub(r"[^A-Z0-9_]", "", btn_label_symbol) or "TOKEN"
-        if buy_url:
-            return InlineKeyboardMarkup([[InlineKeyboardButton(f"BUY ${btn_label_symbol}", url=buy_url)]])
-        return InlineKeyboardMarkup([])
+        lp_url = launchpad_url_for(token, str(source or "")) if bool(token.get("blum_mode")) else ""
+        rows = []
+        if buy_url and lp_url:
+            rows.append([InlineKeyboardButton(f"BUY ${btn_label_symbol}", url=buy_url), InlineKeyboardButton(launchpad_label(token, str(source or "")), url=lp_url)])
+        elif buy_url:
+            rows.append([InlineKeyboardButton(f"BUY ${btn_label_symbol}", url=buy_url)])
+        elif lp_url:
+            rows.append([InlineKeyboardButton(launchpad_label(token, str(source or "")), url=lp_url)])
+        return InlineKeyboardMarkup(rows)
 
     async def _send(dest_chat_id: int):
         if is_trending_dest(int(dest_chat_id)) and float(ton_amt or 0.0) < float(TRENDING_MIN_BUY_TON or 0.0):
