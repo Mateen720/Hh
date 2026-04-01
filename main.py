@@ -24,7 +24,7 @@ log = logging.getLogger("spyton_public")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
-POLL_INTERVAL = max(0.35, float(os.getenv("POLL_INTERVAL", "0.45")))
+POLL_INTERVAL = max(0.25, float(os.getenv("POLL_INTERVAL", "0.30")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/KYRONTrending").strip()
@@ -3055,13 +3055,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "CONFIRM_PREVIEW":
         key = _preview_key(chat.id, user.id)
-        payload = PENDING_TOKEN_PREVIEW.pop(key, None)
+        payload = PENDING_TOKEN_PREVIEW.get(key)
         if not payload:
             await q.answer(_settings_words(_get_group_lang(chat.id, user.id))["preview_expired"], show_alert=True)
             return
-        AWAITING.pop(user.id, None)
-        await _set_token_now(chat.id, str(payload.get("address") or ""), context, chat.id, telegram=str(payload.get("telegram") or ""), dex_mode="both", announce=False)
-        await send_customize_panel(chat.id, context, q.message)
+        try:
+            AWAITING.pop(user.id, None)
+            await _set_token_now(chat.id, str(payload.get("address") or ""), context, chat.id, telegram=str(payload.get("telegram") or ""), dex_mode="both", announce=False)
+            PENDING_TOKEN_PREVIEW.pop(key, None)
+            await send_customize_panel(chat.id, context, q.message)
+        except Exception as e:
+            log.exception("CONFIRM_PREVIEW failed for chat=%s user=%s", chat.id, user.id)
+            await q.answer(f"Setup failed: {type(e).__name__}", show_alert=True)
         return
     if data == "LANG_PRIVATE":
         lang = _get_user_lang(user.id)
@@ -4177,13 +4182,17 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
     if not sym:
         sym = (name[:10] or "TOKEN").upper()
     dex_mode = (dex_mode or "both").lower().strip()
-    # Seed holders once at setup so first buys show holders immediately.
+    # Seed holders / supply once at setup so first buys show stats immediately.
     holders_seed: Optional[int] = None
+    total_supply_seed: Optional[float] = None
     try:
         info_h = tonapi_jetton_info(jetton)
         hh = info_h.get("holders_count")
         if hh is not None:
             holders_seed = int(hh)
+        ts = info_h.get("total_supply")
+        if ts is not None:
+            total_supply_seed = float(ts)
     except Exception:
         pass
     if holders_seed is None:
