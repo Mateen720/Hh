@@ -830,9 +830,19 @@ LAUNCHPAD_BUY_OPS = {
 # Important: launchpad buys often hit a router/launchpad contract, not the jetton master itself,
 # so polling the token master account can miss them entirely. When we know the launchpad contract
 # from a sample tx, we watch that contract instead.
+GROYPAD_DEFAULT_WATCH = str(
+    os.getenv(
+        "GROYPAD_DEFAULT_WATCH",
+        "0:71f1326c1bd3a07e938982e54711ed2ce56b38d1304ce432340f2bc3a404f6a1",
+    )
+).strip()
+
 GROYPAD_WATCH_BY_TOKEN = {
-    # IGOR sample supplied by user on 2026-03-30
-    "EQAOQNg9yr0xNNR45Ebm3Sa2f3Wo5-blxlUGKZhI_b2OLF5d": "0:71f1326c1bd3a07e938982e54711ed2ce56b38d1304ce432340f2bc3a404f6a1",
+    # IGOR sample supplied by user on 2026-03-30.
+    # Kept here for explicit per-token routing, but Groypi / Groypad launch buys
+    # also share the same launch router in newer samples, so we fall back to the
+    # default router when a token has no dedicated mapping.
+    "EQAOQNg9yr0xNNR45Ebm3Sa2f3Wo5-blxlUGKZhI_b2OLF5d": GROYPAD_DEFAULT_WATCH,
 }
 
 def launchpad_watch_address(token: Dict[str, Any]) -> str:
@@ -842,10 +852,13 @@ def launchpad_watch_address(token: Dict[str, Any]) -> str:
     if explicit:
         return explicit
     addr = str(token.get("address") or "").strip()
-    if str(token.get("launchpad") or "").lower() == "groypad":
+    launchpad_name = str(token.get("launchpad") or "").lower().strip()
+    if launchpad_name in ("groypad", "groypi"):
         mapped = GROYPAD_WATCH_BY_TOKEN.get(addr)
         if mapped:
             return mapped
+        if GROYPAD_DEFAULT_WATCH:
+            return GROYPAD_DEFAULT_WATCH
     return addr
 
 
@@ -2708,8 +2721,8 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
-        "launchpad": ("groypad" if (bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")) or (not ston_pool and not dedust_pool)) else ""),
-        "launchpad_watch": GROYPAD_WATCH_BY_TOKEN.get(jetton, ""),
+        "launchpad": ("groypad" if ((not ston_pool and not dedust_pool) or GROYPAD_DEFAULT_WATCH or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, ""))) else ""),
+        "launchpad_watch": (GROYPAD_WATCH_BY_TOKEN.get(jetton, "") or GROYPAD_DEFAULT_WATCH),
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
         "blum_progress_pct": 0.0,
@@ -4163,8 +4176,8 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")),
-        "launchpad": ("groypad" if (bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, "")) or (not ston_pool and not dedust_pool)) else ""),
-        "launchpad_watch": GROYPAD_WATCH_BY_TOKEN.get(jetton, ""),
+        "launchpad": ("groypad" if ((not ston_pool and not dedust_pool) or GROYPAD_DEFAULT_WATCH or bool(GROYPAD_WATCH_BY_TOKEN.get(jetton, ""))) else ""),
+        "launchpad_watch": (GROYPAD_WATCH_BY_TOKEN.get(jetton, "") or GROYPAD_DEFAULT_WATCH),
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
         "blum_progress_pct": 0.0,
@@ -4649,7 +4662,7 @@ async def poll_once(app: Application):
                                 "buyer": b.get("buyer"),
                                 "ton": ton_amt,
                                 "token_amount": float(b.get("token_amount") or 0.0),
-                            }, source=("Groypad" if str(token.get("launchpad") or "").lower()=="groypad" else "Blum"))
+                            }, source=("Groypi" if str(token.get("launchpad") or "").lower() in ("groypad","groypi") else "Blum"))
                             posted_here.append(b)
                         if posted_here:
                             blum_progress_from_buys(token, posted_here)
@@ -4709,7 +4722,7 @@ async def poll_once(app: Application):
                                     "buyer": b.get("buyer"),
                                     "ton": ton_amt,
                                     "token_amount": float(b.get("token_amount") or 0.0),
-                                }, source=("Groypad" if str(token.get("launchpad") or "").lower()=="groypad" else "Blum"))
+                                }, source=("Groypi" if str(token.get("launchpad") or "").lower() in ("groypad","groypi") else "Blum"))
                                 posted_here.append(b)
                             if posted_here:
                                 blum_progress_from_buys(token, posted_here)
