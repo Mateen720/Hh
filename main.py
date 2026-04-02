@@ -1692,6 +1692,9 @@ BOT_USERNAME_CACHE = None
 
 OLD_BUY_MAX_AGE_SECONDS = int(os.getenv("OLD_BUY_MAX_AGE_SECONDS", "120") or "120")
 TX_META_CACHE: Dict[str, Any] = {}
+EVENT_META_CACHE: Dict[str, Any] = {}
+STRICT_TX_REQUIRED = str(os.getenv("STRICT_TX_REQUIRED", "1")).strip().lower() not in ("0","false","no","off")
+RECENT_TX_WINDOW_SECONDS = int(os.getenv("RECENT_TX_WINDOW_SECONDS", str(max(OLD_BUY_MAX_AGE_SECONDS, 1800))) or str(max(OLD_BUY_MAX_AGE_SECONDS, 1800)))
 
 def _is_stale_post(ts_value: Any, max_age: int | None = None) -> bool:
     try:
@@ -1763,12 +1766,44 @@ def tonapi_recent_tx_meta(address: str, limit: int = 40, ttl: int = 20) -> Dict[
     TX_META_CACHE[ck] = {'ts': now, 'data': out}
     return out
 
+def tonapi_recent_event_meta(address: str, limit: int = 60, ttl: int = 20) -> Dict[str, Dict[str, Any]]:
+    """Recent event metadata cache keyed by normalized tx/event ids."""
+    addr = str(address or '').strip()
+    if not addr:
+        return {}
+    now = int(time.time())
+    ck = f"ev:{addr}:{int(limit or 60)}"
+    cached = EVENT_META_CACHE.get(ck)
+    if isinstance(cached, dict) and now - int(cached.get('ts') or 0) < max(int(ttl or 20), 1):
+        data = cached.get('data')
+        return data if isinstance(data, dict) else {}
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        for ev in tonapi_account_events(addr, int(limit or 60)):
+            if not isinstance(ev, dict):
+                continue
+            ts = 0
+            try:
+                ts = int(float(ev.get('timestamp') or ev.get('time') or 0))
+            except Exception:
+                ts = 0
+            if ts > 10_000_000_000:
+                ts //= 1000
+            eid = str(ev.get('event_id') or ev.get('id') or '').strip()
+            h = _normalize_tx_hash_to_hex(tonapi_event_tx_hash(ev) or '')
+            for key in (h, eid):
+                if key:
+                    out[key] = {'ts': int(ts or 0), 'failed': False}
+    except Exception:
+        out = {}
+    EVENT_META_CACHE[ck] = {'ts': now, 'data': out}
+    return out
+
 def should_skip_by_tx_meta(account_addr: str, tx_hash: Any, fallback_ts: Any = 0, ignore_before: int = 0) -> tuple[bool, int]:
     """Return (skip, resolved_ts).
 
-    Prefer recent TonAPI tx metadata when available. If the tx is not found there and
-    we also do not have a usable timestamp from the trade/event itself, skip it to avoid
-    replaying stale history after restarts.
+    Prefer recent TonAPI tx metadata, then recent account event metadata.
+    If we still cannot verify a recent timestamp, skip the item rather than replaying backlog.
     """
     resolved_ts = 0
     try:
@@ -1778,19 +1813,31 @@ def should_skip_by_tx_meta(account_addr: str, tx_hash: Any, fallback_ts: Any = 0
     if resolved_ts > 10_000_000_000:
         resolved_ts //= 1000
     h = _normalize_tx_hash_to_hex(tx_hash)
-    meta = tonapi_recent_tx_meta(account_addr, 40, 20) if account_addr else {}
-    info = meta.get(h) if h else None
+    raw = str(tx_hash or '').strip()
+    meta = tonapi_recent_tx_meta(account_addr, 80, 20) if account_addr else {}
+    info = None
+    if h:
+        info = meta.get(h)
+    if not isinstance(info, dict) and account_addr:
+        evmeta = tonapi_recent_event_meta(account_addr, 80, 20)
+        if h:
+            info = evmeta.get(h)
+        if not isinstance(info, dict) and raw:
+            info = evmeta.get(raw)
     if isinstance(info, dict):
         mts = int(info.get('ts') or 0)
         if mts > 0:
             resolved_ts = mts
         if bool(info.get('failed')):
             return True, resolved_ts
-    elif h and not resolved_ts:
+    elif STRICT_TX_REQUIRED and not resolved_ts:
         return True, 0
     if ignore_before and resolved_ts and resolved_ts < int(ignore_before or 0):
         return True, resolved_ts
-    if _is_stale_post(resolved_ts):
+    freshness_cutoff = int(time.time()) - max(int(RECENT_TX_WINDOW_SECONDS or 0), 1)
+    if not resolved_ts or resolved_ts < freshness_cutoff:
+        return True, resolved_ts
+    if _is_stale_post(resolved_ts, max_age=max(int(RECENT_TX_WINDOW_SECONDS or 0), int(OLD_BUY_MAX_AGE_SECONDS or 0))):
         return True, resolved_ts
     return False, resolved_ts
 
