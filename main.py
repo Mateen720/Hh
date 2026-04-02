@@ -5947,14 +5947,26 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 )
         else:
             if is_trending_dest(int(dest_chat_id)):
-                entity_text, entity_list = build_trending_channel_entities_message()
-                await app.bot.send_message(
-                    chat_id=dest_chat_id,
-                    text=entity_text,
-                    entities=entity_list,
-                    disable_web_page_preview=True,
-                    reply_markup=kb,
-                )
+                # Channel posts: first try real custom-emoji entities.
+                # If Telegram rejects any entity combination, fall back to the HTML message
+                # so buys still post in the channel instead of failing silently.
+                try:
+                    entity_text, entity_list = build_trending_channel_entities_message()
+                    await app.bot.send_message(
+                        chat_id=dest_chat_id,
+                        text=entity_text,
+                        entities=entity_list,
+                        disable_web_page_preview=True,
+                        reply_markup=kb,
+                    )
+                except Exception:
+                    await app.bot.send_message(
+                        chat_id=dest_chat_id,
+                        text=local_msg,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        reply_markup=kb,
+                    )
             else:
                 await app.bot.send_message(
                     chat_id=dest_chat_id,
