@@ -1690,6 +1690,7 @@ TON_PRICE_CACHE: Dict[str, Any] = {"ts": 0, "usd": None}
 BOT_USERNAME_CACHE = None
 
 OLD_BUY_MAX_AGE_SECONDS = int(os.getenv("OLD_BUY_MAX_AGE_SECONDS", "180") or "180")
+TX_META_CACHE: Dict[str, Any] = {}
 
 def _is_stale_post(ts_value: Any, max_age: int | None = None) -> bool:
     try:
@@ -1704,6 +1705,93 @@ def _is_stale_post(ts_value: Any, max_age: int | None = None) -> bool:
     if age_cap <= 0:
         return False
     return ts_i < int(time.time()) - age_cap
+
+def tonapi_recent_tx_meta(address: str, limit: int = 40, ttl: int = 20) -> Dict[str, Dict[str, Any]]:
+    """Recent tx metadata cache keyed by normalized tx hash."""
+    addr = str(address or '').strip()
+    if not addr:
+        return {}
+    now = int(time.time())
+    ck = f"{addr}:{int(limit or 40)}"
+    cached = TX_META_CACHE.get(ck)
+    if isinstance(cached, dict) and now - int(cached.get('ts') or 0) < max(int(ttl or 20), 1):
+        data = cached.get('data')
+        return data if isinstance(data, dict) else {}
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        for tx in tonapi_account_transactions(addr, int(limit or 40)):
+            if not isinstance(tx, dict):
+                continue
+            h = _normalize_tx_hash_to_hex(_tx_hash(tx) or tx.get('hash') or tx.get('id') or '')
+            if not h:
+                continue
+            ts = 0
+            for k in ('utime', 'now', 'timestamp', 'tx_time', 'time'):
+                try:
+                    v = tx.get(k)
+                    if v is None:
+                        continue
+                    ts = int(float(v or 0))
+                    break
+                except Exception:
+                    pass
+            if ts > 10_000_000_000:
+                ts //= 1000
+            failed = False
+            try:
+                if tx.get('success') is False or tx.get('aborted') is True:
+                    failed = True
+            except Exception:
+                pass
+            try:
+                desc = tx.get('description') or {}
+                if isinstance(desc, dict):
+                    if desc.get('aborted') is True or str(desc.get('type') or '').lower() == 'aborted':
+                        failed = True
+                    action_phase = desc.get('action_phase') or desc.get('actionPhase') or {}
+                    if isinstance(action_phase, dict) and action_phase.get('success') is False:
+                        failed = True
+                    compute_phase = desc.get('compute_phase') or desc.get('computePhase') or {}
+                    if isinstance(compute_phase, dict) and compute_phase.get('success') is False:
+                        failed = True
+            except Exception:
+                pass
+            out[h] = {'ts': int(ts or 0), 'failed': bool(failed)}
+    except Exception:
+        out = {}
+    TX_META_CACHE[ck] = {'ts': now, 'data': out}
+    return out
+
+def should_skip_by_tx_meta(account_addr: str, tx_hash: Any, fallback_ts: Any = 0, ignore_before: int = 0) -> tuple[bool, int]:
+    """Return (skip, resolved_ts).
+
+    Prefer recent TonAPI tx metadata when available. If the tx is not found there and
+    we also do not have a usable timestamp from the trade/event itself, skip it to avoid
+    replaying stale history after restarts.
+    """
+    resolved_ts = 0
+    try:
+        resolved_ts = int(float(fallback_ts or 0))
+    except Exception:
+        resolved_ts = 0
+    if resolved_ts > 10_000_000_000:
+        resolved_ts //= 1000
+    h = _normalize_tx_hash_to_hex(tx_hash)
+    meta = tonapi_recent_tx_meta(account_addr, 40, 20) if account_addr else {}
+    info = meta.get(h) if h else None
+    if isinstance(info, dict):
+        mts = int(info.get('ts') or 0)
+        if mts > 0:
+            resolved_ts = mts
+        if bool(info.get('failed')):
+            return True, resolved_ts
+    elif h and not resolved_ts:
+        return True, 0
+    if ignore_before and resolved_ts and resolved_ts < int(ignore_before or 0):
+        return True, resolved_ts
+    if _is_stale_post(resolved_ts):
+        return True, resolved_ts
+    return False, resolved_ts
 
 async def get_bot_username(bot):
     global BOT_USERNAME_CACHE
@@ -4833,11 +4921,11 @@ async def poll_once(app: Application):
                 max_seen_ts = last_ts
 
                 for lt_i, ts_i, b, tr in items2:
-                    # ignore old history right after token added
-                    if ignore_before and ts_i and ts_i < ignore_before:
+                    skip_trade, resolved_ts = should_skip_by_tx_meta(pool, b.get("tx"), ts_i, ignore_before)
+                    if skip_trade:
                         continue
-                    if _is_stale_post(ts_i):
-                        continue
+                    if resolved_ts:
+                        ts_i = int(resolved_ts)
 
                     is_new = False
                     if lt_i and last_lt:
@@ -4922,10 +5010,11 @@ async def poll_once(app: Application):
                                         break
                                     if last_ets and ts and ts <= last_ets:
                                         continue
-                                    if ignore_before and ts and ts < ignore_before:
+                                    skip_ev, resolved_ts = should_skip_by_tx_meta(pool, tonapi_event_tx_hash(ev), ts, ignore_before)
+                                    if skip_ev:
                                         continue
-                                    if _is_stale_post(ts):
-                                        continue
+                                    if resolved_ts:
+                                        ts = int(resolved_ts)
                                     new_events.append(ev)
                 
                                 for ev in reversed(new_events):
@@ -5101,10 +5190,11 @@ async def poll_once(app: Application):
                             break
                         if last_lt and lt0 and lt0 == last_lt:
                             break
-                        if ignore_before and uts0 and uts0 < ignore_before:
+                        skip_tx0, resolved_uts0 = should_skip_by_tx_meta(watch_addr, txh0, uts0, ignore_before)
+                        if skip_tx0:
                             continue
-                        if _is_stale_post(uts0):
-                            continue
+                        if resolved_uts0:
+                            uts0 = int(resolved_uts0)
                         new_txs.append(txo)
 
                     for txo in reversed(new_txs):
