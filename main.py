@@ -4726,7 +4726,23 @@ async def poll_once(app: Application):
                             token["last_blum_event_ts"] = ts_new
 
                 # 2) Raw tx fallback for bonding buys like the supplied sample tx
-                txs = await _to_thread(tonapi_account_transactions, watch_addr, BLUM_TX_LIMIT)
+                # IMPORTANT: Groypi / Groypad can route multiple token buys through the same
+                # shared launchpad router. Polling raw transactions on that shared router is
+                # ambiguous and can make one token reuse another token's buy (for example,
+                # IGOR buys showing up under a different Groypi token). TonAPI account events
+                # above are token-aware because they expose JettonTransfer.jetton, so for the
+                # shared Groypi router we skip the raw-tx fallback and only use the event pass.
+                shared_groypad_router = bool(
+                    str(token.get("launchpad") or "").lower() in ("groypad", "groypi")
+                    and watch_addr
+                    and GROYPAD_DEFAULT_WATCH
+                    and str(watch_addr).strip() == str(GROYPAD_DEFAULT_WATCH).strip()
+                    and str(token.get("launchpad_watch") or "").strip() in ("", str(GROYPAD_DEFAULT_WATCH).strip())
+                )
+                if shared_groypad_router:
+                    txs = []
+                else:
+                    txs = await _to_thread(tonapi_account_transactions, watch_addr, BLUM_TX_LIMIT)
                 if isinstance(txs, list) and txs:
                     last_tx = str(token.get("last_blum_tx") or "").strip()
                     last_lt = str(token.get("last_blum_lt") or "").strip()
