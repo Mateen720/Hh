@@ -5,7 +5,7 @@ from urllib.parse import urlparse, quote
 import requests
 
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageEntity
 from telegram.error import Conflict
 from telegram.ext import (
     Application, ApplicationBuilder,
@@ -5786,6 +5786,94 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             rows.append([InlineKeyboardButton(launchpad_label(token, str(source or "")), url=lp_url)])
         return InlineKeyboardMarkup(rows)
 
+    def _utf16_len(s: str) -> int:
+        try:
+            return len((s or "").encode("utf-16-le")) // 2
+        except Exception:
+            return len(s or "")
+
+    def _render_html_with_custom_emoji_entities(src: str):
+        """Best-effort renderer for the channel message.
+        Supports the tags we generate here: <b>, <a href=...>, and <tg-emoji emoji-id=...>.
+        Returns plain text plus Telegram entities so premium emoji also render in channels.
+        """
+        src = str(src or "")
+        out = []
+        entities = []
+        stack = []
+        i = 0
+        import re as _re
+        while i < len(src):
+            if src.startswith('<b>', i):
+                stack.append(('bold', _utf16_len(''.join(out)), None))
+                i += 3
+                continue
+            if src.startswith('</b>', i):
+                for j in range(len(stack)-1, -1, -1):
+                    if stack[j][0] == 'bold':
+                        _t, off, _u = stack.pop(j)
+                        ln = _utf16_len(''.join(out)) - off
+                        if ln > 0:
+                            entities.append(MessageEntity(type='bold', offset=off, length=ln))
+                        break
+                i += 4
+                continue
+            if src.startswith('<a ', i):
+                m = _re.match(r'<a\s+href="([^"]+)">', src[i:])
+                if m:
+                    stack.append(('text_link', _utf16_len(''.join(out)), html.unescape(m.group(1))))
+                    i += m.end()
+                    continue
+            if src.startswith('</a>', i):
+                for j in range(len(stack)-1, -1, -1):
+                    if stack[j][0] == 'text_link':
+                        _t, off, url = stack.pop(j)
+                        ln = _utf16_len(''.join(out)) - off
+                        if ln > 0 and url:
+                            entities.append(MessageEntity(type='text_link', offset=off, length=ln, url=url))
+                        break
+                i += 4
+                continue
+            if src.startswith('<tg-emoji', i):
+                m = _re.match(r'<tg-emoji\s+emoji-id="([^"]+)"[^>]*>(.*?)</tg-emoji>', src[i:], _re.S)
+                if m:
+                    emoji_id = str(m.group(1))
+                    inner = html.unescape(m.group(2) or '▫')
+                    if not inner:
+                        inner = '▫'
+                    off = _utf16_len(''.join(out))
+                    out.append(inner)
+                    ln = _utf16_len(inner)
+                    entities.append(MessageEntity(type='custom_emoji', offset=off, length=ln, custom_emoji_id=emoji_id))
+                    i += m.end()
+                    continue
+            if src.startswith('&amp;', i):
+                out.append('&'); i += 5; continue
+            if src.startswith('&lt;', i):
+                out.append('<'); i += 4; continue
+            if src.startswith('&gt;', i):
+                out.append('>'); i += 4; continue
+            if src.startswith('&quot;', i):
+                out.append('"'); i += 6; continue
+            if src.startswith('&#x27;', i) or src.startswith('&#39;', i):
+                out.append("'"); i += 6 if src.startswith('&#39;', i) else 6; continue
+            out.append(src[i])
+            i += 1
+
+        plain = ''.join(out)
+        # close any still-open tags gracefully
+        end_off = _utf16_len(plain)
+        for kind, off, url in stack:
+            ln = end_off - off
+            if ln <= 0:
+                continue
+            if kind == 'bold':
+                entities.append(MessageEntity(type='bold', offset=off, length=ln))
+            elif kind == 'text_link' and url:
+                entities.append(MessageEntity(type='text_link', offset=off, length=ln, url=url))
+        entities.sort(key=lambda e: (e.offset, e.length))
+        return plain, entities
+
     async def _send(dest_chat_id: int):
         if is_trending_dest(int(dest_chat_id)) and float(ton_amt or 0.0) < float(TRENDING_MIN_BUY_TON or 0.0):
             return
@@ -5820,13 +5908,23 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     reply_markup=kb,
                 )
         else:
-            await app.bot.send_message(
-                chat_id=dest_chat_id,
-                text=local_msg,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=kb,
-            )
+            if is_trending_dest(int(dest_chat_id)) and '<tg-emoji' in local_msg:
+                plain_text, entity_list = _render_html_with_custom_emoji_entities(local_msg)
+                await app.bot.send_message(
+                    chat_id=dest_chat_id,
+                    text=plain_text,
+                    entities=entity_list,
+                    disable_web_page_preview=True,
+                    reply_markup=kb,
+                )
+            else:
+                await app.bot.send_message(
+                    chat_id=dest_chat_id,
+                    text=local_msg,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=kb,
+                )
 
     try:
         await _send(chat_id)
