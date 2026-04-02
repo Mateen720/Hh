@@ -5665,6 +5665,184 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         ])
         return "\n".join([b for b in blocks if b is not None])
 
+    def _extract_custom_emoji_id(raw: str) -> str:
+        try:
+            m = re.search(r'emoji-id\s*=\s*"?(\d+)"?', str(raw or ""))
+            return m.group(1) if m else ""
+        except Exception:
+            return ""
+
+    def _plain_emoji_text(raw: str, fallback: str = "") -> str:
+        txt = re.sub(r"<[^>]+>", "", str(raw or "")).strip()
+        return txt or fallback
+
+    def build_trending_channel_payload() -> Tuple[str, List[MessageEntity]]:
+        """Trending channel message built with entities so premium emojis render reliably in channels."""
+        parts: List[str] = []
+        entities: List[MessageEntity] = []
+
+        def add(text: str, entity_specs: Optional[List[Dict[str, Any]]] = None):
+            base = sum(len(x) for x in parts)
+            parts.append(text)
+            for spec in (entity_specs or []):
+                spec2 = dict(spec)
+                spec2["offset"] = base + int(spec2.get("offset", 0))
+                entities.append(MessageEntity(**spec2))
+
+        def add_icon(name: str, fallback: str):
+            raw = premium_icon(name, fallback)
+            cid = _extract_custom_emoji_id(raw)
+            if cid:
+                add("▫", [{"type": "custom_emoji", "offset": 0, "length": 1, "custom_emoji_id": str(cid)}])
+            else:
+                add(_plain_emoji_text(raw, fallback))
+
+        def add_text_link(label: str, url: str):
+            if url:
+                add(label, [{"type": "text_link", "offset": 0, "length": len(label), "url": str(url)}])
+            else:
+                add(label)
+
+        def add_bold(label: str):
+            add(label, [{"type": "bold", "offset": 0, "length": len(label)}])
+
+        def add_strength_line():
+            if not bool(s.get("strength_on", True)):
+                return
+            try:
+                step = float(s.get("strength_step_ton") or 5.0)
+                max_n = int(s.get("strength_max") or 30)
+                emo = str(s.get("strength_emoji") or "🟢")
+                n = 1 if ton_amt > 0 else 0
+                if step > 0:
+                    effective_step = max(step, float(ton_amt) / 9.0) if ton_amt > 0 else step
+                    n = max(1, int(float(ton_amt) // effective_step))
+                n = min(max_n, max(1, n))
+            except Exception:
+                n = 0
+                emo = "🟢"
+            if n <= 0:
+                return
+            cid = _extract_custom_emoji_id(emo)
+            plain_emo = _plain_emoji_text(emo, "🟢")
+            per_line = 12
+            remaining = n
+            while remaining > 0:
+                take = min(per_line, remaining)
+                if cid:
+                    for _ in range(take):
+                        add("▫", [{"type": "custom_emoji", "offset": 0, "length": 1, "custom_emoji_id": str(cid)}])
+                else:
+                    add(plain_emo * take)
+                remaining -= take
+                if remaining > 0:
+                    add("\n")
+
+        header_token = (tok_symbol or title or "TOKEN")
+        add_icon("title", "🚀")
+        add(" | ")
+        link_for_symbol = tg_link or chart_link or ""
+        if link_for_symbol:
+            add_text_link(header_token, link_for_symbol)
+            entities.append(MessageEntity(type="bold", offset=sum(len(x) for x in parts) - len(header_token), length=len(header_token)))
+        else:
+            add_bold(header_token)
+        add(" Buy! ")
+        add_icon("dex", "✨")
+        add("\n\n")
+
+        add_strength_line()
+        add("\n\n")
+
+        add(" ")
+        add_icon("spent", "💎")
+        add(f"  {ton_amt:,.2f} TON{usd_disp}")
+        add("\n")
+
+        if tok_amt and tok_symbol:
+            add_icon("got", "🪙")
+            add(" ")
+            try:
+                tok_amt_txt = fmt_token_amount(float(tok_amt))
+            except Exception:
+                tok_amt_txt = str(tok_amt)
+            token_label = f"{tok_amt_txt} {tok_symbol}"
+            if tg_link:
+                add_text_link(token_label, tg_link)
+                entities.append(MessageEntity(type="bold", offset=sum(len(x) for x in parts) - len(token_label), length=len(token_label)))
+            else:
+                add_bold(token_label)
+            add("\n")
+
+        def _fmt_compact_int(n: Optional[int]) -> str:
+            if n is None:
+                return "—"
+            try:
+                x = float(n)
+            except Exception:
+                return "—"
+            if x >= 1_000_000:
+                return f"{x/1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+            if x >= 1_000:
+                return f"{x/1_000:.2f}".rstrip("0").rstrip(".") + "K"
+            return f"{int(x):,}"
+
+        holders_compact = _fmt_compact_int(int(holders) if holders is not None else None)
+        add_icon("holders", "👥")
+        add(f" {holders_compact} Holders\n")
+
+        add_icon("wallet", "👛")
+        add(" ")
+        buyer_label = buyer_short or "—"
+        if buyer_url:
+            add_text_link(buyer_label, buyer_url)
+        else:
+            add(buyer_label)
+        if isinstance(change_pct, (int, float)):
+            try:
+                v = float(change_pct)
+                sign = "+" if v > 0 else ""
+                add(f": {sign}{v:.1f}%")
+            except Exception:
+                pass
+        add(" | ")
+        if tx_url:
+            add_text_link("Txn", tx_url)
+        else:
+            add("Txn")
+        add("\n")
+
+        add_icon("price", "💵")
+        try:
+            price_txt = f"${float(price_usd):,.6f}" if price_usd is not None else "—"
+        except Exception:
+            price_txt = "—"
+        add(f" Price: {price_txt}\n")
+
+        add_icon("mcap", "📊")
+        add(f" MarketCap: {fmt_usd(mc_usd, 0) or '—'}\n\n")
+
+        add_icon("spent", "💎")
+        add(" ")
+        add_text_link("Listing", LISTING_URL) if LISTING_URL else add("Listing")
+        add(" | ")
+        add_icon("buy", "🛒")
+        add(" ")
+        add_text_link("Buy", buy_url) if buy_url else add("Buy")
+        add(" | ")
+        add_icon("chart", "📈")
+        add(" ")
+        add_text_link("Chart", chart_link) if chart_link else add("Chart")
+        add("\n")
+
+        add("ad: ")
+        if ad_link:
+            add_text_link(str(ad_text), ad_link)
+        else:
+            add(str(ad_text))
+
+        return "".join(parts), entities
+
     def build_trending_channel_message() -> str:
         """Trending channel style (only). Keeps all clickable links, but uses the requested layout."""
         # Header: | TOKEN Buy! (TOKEN clickable to Telegram when available)
@@ -5786,102 +5964,28 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             rows.append([InlineKeyboardButton(launchpad_label(token, str(source or "")), url=lp_url)])
         return InlineKeyboardMarkup(rows)
 
-    def _utf16_len(s: str) -> int:
-        try:
-            return len((s or "").encode("utf-16-le")) // 2
-        except Exception:
-            return len(s or "")
-
-    def _render_html_with_custom_emoji_entities(src: str):
-        """Best-effort renderer for the channel message.
-        Supports the tags we generate here: <b>, <a href=...>, and <tg-emoji emoji-id=...>.
-        Returns plain text plus Telegram entities so premium emoji also render in channels.
-        """
-        src = str(src or "")
-        out = []
-        entities = []
-        stack = []
-        i = 0
-        import re as _re
-        while i < len(src):
-            if src.startswith('<b>', i):
-                stack.append(('bold', _utf16_len(''.join(out)), None))
-                i += 3
-                continue
-            if src.startswith('</b>', i):
-                for j in range(len(stack)-1, -1, -1):
-                    if stack[j][0] == 'bold':
-                        _t, off, _u = stack.pop(j)
-                        ln = _utf16_len(''.join(out)) - off
-                        if ln > 0:
-                            entities.append(MessageEntity(type='bold', offset=off, length=ln))
-                        break
-                i += 4
-                continue
-            if src.startswith('<a ', i):
-                m = _re.match(r'<a\s+href="([^"]+)">', src[i:])
-                if m:
-                    stack.append(('text_link', _utf16_len(''.join(out)), html.unescape(m.group(1))))
-                    i += m.end()
-                    continue
-            if src.startswith('</a>', i):
-                for j in range(len(stack)-1, -1, -1):
-                    if stack[j][0] == 'text_link':
-                        _t, off, url = stack.pop(j)
-                        ln = _utf16_len(''.join(out)) - off
-                        if ln > 0 and url:
-                            entities.append(MessageEntity(type='text_link', offset=off, length=ln, url=url))
-                        break
-                i += 4
-                continue
-            if src.startswith('<tg-emoji', i):
-                m = _re.match(r'<tg-emoji\s+emoji-id="([^"]+)"[^>]*>(.*?)</tg-emoji>', src[i:], _re.S)
-                if m:
-                    emoji_id = str(m.group(1))
-                    inner = html.unescape(m.group(2) or '▫')
-                    if not inner:
-                        inner = '▫'
-                    off = _utf16_len(''.join(out))
-                    out.append(inner)
-                    ln = _utf16_len(inner)
-                    entities.append(MessageEntity(type='custom_emoji', offset=off, length=ln, custom_emoji_id=emoji_id))
-                    i += m.end()
-                    continue
-            if src.startswith('&amp;', i):
-                out.append('&'); i += 5; continue
-            if src.startswith('&lt;', i):
-                out.append('<'); i += 4; continue
-            if src.startswith('&gt;', i):
-                out.append('>'); i += 4; continue
-            if src.startswith('&quot;', i):
-                out.append('"'); i += 6; continue
-            if src.startswith('&#x27;', i) or src.startswith('&#39;', i):
-                out.append("'"); i += 6 if src.startswith('&#39;', i) else 6; continue
-            out.append(src[i])
-            i += 1
-
-        plain = ''.join(out)
-        # close any still-open tags gracefully
-        end_off = _utf16_len(plain)
-        for kind, off, url in stack:
-            ln = end_off - off
-            if ln <= 0:
-                continue
-            if kind == 'bold':
-                entities.append(MessageEntity(type='bold', offset=off, length=ln))
-            elif kind == 'text_link' and url:
-                entities.append(MessageEntity(type='text_link', offset=off, length=ln, url=url))
-        entities.sort(key=lambda e: (e.offset, e.length))
-        return plain, entities
-
     async def _send(dest_chat_id: int):
         if is_trending_dest(int(dest_chat_id)) and float(ton_amt or 0.0) < float(TRENDING_MIN_BUY_TON or 0.0):
             return
         kb = build_buy_keyboard(int(dest_chat_id))
-        local_msg = build_trending_channel_message() if is_trending_dest(int(dest_chat_id)) else build_group_message()
+        is_trending = is_trending_dest(int(dest_chat_id))
+        local_msg = build_trending_channel_message() if is_trending else build_group_message()
+
+        # For channel posts, use entity-based formatting so premium custom emojis
+        # render the same way as the group style.
+        if is_trending:
+            text_payload, entity_payload = build_trending_channel_payload()
+            await app.bot.send_message(
+                chat_id=dest_chat_id,
+                text=text_payload,
+                entities=entity_payload,
+                disable_web_page_preview=True,
+                reply_markup=kb,
+            )
+            return
 
         # Never send group buy media into the trending channel.
-        if use_image and (not is_trending_dest(int(dest_chat_id))):
+        if use_image and (not is_trending):
             if buy_media_type == "animation":
                 await app.bot.send_animation(
                     chat_id=dest_chat_id,
@@ -5908,23 +6012,13 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     reply_markup=kb,
                 )
         else:
-            if is_trending_dest(int(dest_chat_id)) and '<tg-emoji' in local_msg:
-                plain_text, entity_list = _render_html_with_custom_emoji_entities(local_msg)
-                await app.bot.send_message(
-                    chat_id=dest_chat_id,
-                    text=plain_text,
-                    entities=entity_list,
-                    disable_web_page_preview=True,
-                    reply_markup=kb,
-                )
-            else:
-                await app.bot.send_message(
-                    chat_id=dest_chat_id,
-                    text=local_msg,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                    reply_markup=kb,
-                )
+            await app.bot.send_message(
+                chat_id=dest_chat_id,
+                text=local_msg,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=kb,
+            )
 
     try:
         await _send(chat_id)
