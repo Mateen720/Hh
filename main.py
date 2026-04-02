@@ -6398,6 +6398,23 @@ def run_flask():
 
 # -------------------- MAIN --------------------
 async def post_init(app: Application):
+    # Baseline all existing configured tokens on startup so a restart does not replay old buys.
+    try:
+        for chat_id_s, g in list(GROUPS.items()):
+            try:
+                token = (g or {}).get("token") or {}
+                if not isinstance(token, dict) or not token.get("address"):
+                    continue
+                chat_id_i = int(chat_id_s)
+                token["ignore_before_ts"] = int(time.time())
+                await warmup_seen_for_chat(chat_id_i, token.get("ston_pool"), token.get("dedust_pool"))
+            except Exception as _e:
+                log.debug("startup warmup err chat=%s %s", chat_id_s, _e)
+        save_groups()
+        log.info("Startup warmup finished.")
+    except Exception as _e:
+        log.debug("startup warmup failed %s", _e)
+
     # start tracker
     app.create_task(tracker_loop(app))
     log.info("Tracker started.")
