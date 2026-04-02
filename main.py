@@ -2465,125 +2465,124 @@ def _to_float(x) -> float:
         return 0.0
 
 def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
-    """Heuristic buy parser from TonAPI tx actions.
-    BUY = TON -> token_addr.
-    """
-    out: List[Dict[str, Any]] = []
-    tx_hash = _tx_hash(tx)
+    """Conservative STON.fi buy parser from TonAPI tx actions.
 
+    Important: pool-account TonAPI swap actions can be rendered from the pool's point of
+    view, which can make sells look like buys if we trust only `asset_in/asset_out`.
+    To avoid posting sells as buys, we only emit a buy when we can correlate BOTH:
+      1) target jetton transferred OUT to an end-user wallet, and
+      2) TON spent BY that same wallet in the same transaction/event.
+    """
+    if not isinstance(tx, dict):
+        return []
+
+    tx_hash = _tx_hash(tx)
     actions = tx.get("actions")
     if not isinstance(actions, list):
         actions = []
 
+    def _addr(v: Any) -> str:
+        if isinstance(v, dict):
+            return str(v.get("address") or v.get("account") or v.get("wallet") or "").strip()
+        return str(v or "").strip()
+
+    def _amt(raw: Any, decimals: int = 9) -> float:
+        s = str(raw or "").strip()
+        if not s:
+            return 0.0
+        try:
+            if s.replace('-', '').isdigit():
+                return int(s) / (10 ** max(int(decimals or 0), 0))
+            return float(s)
+        except Exception:
+            return 0.0
+
+    token_decimals = 9
+    try:
+        token_decimals = int(get_jetton_meta(token_addr).get("decimals") or 9)
+    except Exception:
+        token_decimals = 9
+
+    # Candidate token transfers OUT to user wallets.
+    candidates: List[Tuple[str, float]] = []
     for a in actions:
         if not isinstance(a, dict):
             continue
-        payload = a.get(a.get('type') or a.get('action') or a.get('name'))
-        aa = dict(a)
-        if isinstance(payload, dict):
-            aa.update(payload)
-
-        at = _action_type(aa).lower()
-        if "swap" not in at and "dex" not in at:
+        if a.get("type") != "JettonTransfer":
+            continue
+        jt = a.get("JettonTransfer")
+        if not isinstance(jt, dict):
+            continue
+        jetton = jt.get("jetton") or {}
+        jetton_addr = _addr(jetton) or str(jetton.get("master") or jetton.get("jetton_master") or "").strip()
+        if jetton_addr != token_addr:
             continue
 
-        dex = aa.get("dex")
-        dex_name = ""
-        if isinstance(dex, dict):
-            dex_name = str(dex.get("name") or dex.get("title") or dex.get("id") or "").lower()
-        if dex_name and "ston" not in dex_name:
+        recipient = _addr(jt.get("recipient"))
+        sender = _addr(jt.get("sender"))
+        if not recipient or recipient == sender or recipient == token_addr:
             continue
 
-        in_asset = aa.get("asset_in") or aa.get("assetIn") or aa.get("in") or {}
-        out_asset = aa.get("asset_out") or aa.get("assetOut") or aa.get("out") or {}
+        dec = token_decimals
+        try:
+            if isinstance(jetton, dict) and jetton.get("decimals") is not None:
+                dec = int(jetton.get("decimals") or token_decimals)
+        except Exception:
+            dec = token_decimals
 
-        def _asset_addr(x: Any) -> str:
-            if isinstance(x, dict):
-                addr = x.get("address") or x.get("master") or x.get("jetton_master") or x.get("jettonMaster") or ""
-                return str(addr)
-            return ""
-
-        def _is_ton_asset(x: Any) -> bool:
-            if not isinstance(x, dict):
-                return False
-            t = str(x.get("type") or x.get("kind") or x.get("asset_type") or "").lower()
-            if t == "ton":
-                return True
-            sym = str(x.get("symbol") or x.get("ticker") or x.get("name") or "").lower()
-            if sym in ("ton","wton","pton"):
-                return True
-            # TonAPI sometimes stores ton as a dict without address, but with decimals=9
-            if _asset_addr(x) in ("", None) and str(x).lower().find("ton") != -1:
-                return True
-            return False
-
-        def _parse_amount(raw: Any, asset: Any) -> Optional[float]:
-            """Handle both already-decimal numbers and raw on-chain integers."""
-            if raw is None:
-                return None
-            # numeric
-            if isinstance(raw, (int, float)):
-                val = float(raw)
-            else:
-                s = str(raw).strip()
-                if not s:
-                    return None
-                # if it looks like an integer string, keep as int-like
-                if s.replace("-", "").isdigit():
-                    try:
-                        val = float(int(s))
-                    except Exception:
-                        val = _to_float(s)
-                else:
-                    val = _to_float(s)
-
-            # scale if it looks like a raw integer
-            dec = None
-            if isinstance(asset, dict):
-                d = asset.get("decimals")
-                if isinstance(d, int):
-                    dec = d
-                else:
-                    try:
-                        dec = int(d)
-                    except Exception:
-                        dec = None
-
-            if dec is not None:
-                # If we got a big integer-ish value and no decimal point in original, assume raw.
-                raw_s = str(raw).strip() if raw is not None else ""
-                if raw_s and raw_s.replace("-", "").isdigit() and abs(val) >= 10 ** (dec + 2):
-                    val = val / (10 ** dec)
-
-            return val
-
-        in_addr = _asset_addr(in_asset)
-        out_addr = _asset_addr(out_asset)
-
-        amt_in = _parse_amount(aa.get("amount_in") or aa.get("amountIn"), in_asset)
-        amt_out = _parse_amount(aa.get("amount_out") or aa.get("amountOut"), out_asset)
-
-        # BUY must be TON -> token
-        if not (_is_ton_asset(in_asset) and str(out_addr) == str(token_addr)):
+        token_amount = _amt(jt.get("amount"), dec)
+        if token_amount <= 0:
             continue
+        candidates.append((recipient, token_amount))
 
-        ton_in = amt_in
-        jet_out = amt_out
-        if not ton_in or not jet_out:
+    if not candidates:
+        return []
+
+    # Correlate TON spent by the same wallet.
+    ton_spent_by: Dict[str, float] = {}
+    for a in actions:
+        if not isinstance(a, dict):
             continue
+        t = str(a.get("type") or "")
+        if t not in ("TonTransfer", "TONTransfer", "Transfer"):
+            continue
+        tt = a.get("TonTransfer") or a.get("TONTransfer") or a.get("Transfer")
+        if not isinstance(tt, dict):
+            continue
+        sender_addr = _addr(tt.get("sender"))
+        recip_addr = _addr(tt.get("recipient"))
+        ton_amt = _amt(tt.get("amount"), 9)
+        if ton_amt <= 0 or not sender_addr or not recip_addr or sender_addr == recip_addr:
+            continue
+        ton_spent_by[sender_addr] = max(ton_spent_by.get(sender_addr, 0.0), ton_amt)
 
-        buyer = (aa.get("user") or aa.get("sender") or aa.get("initiator") or aa.get("from") or "")
-        if isinstance(buyer, dict):
-            buyer = buyer.get("address") or ""
-        buyer = str(buyer)
+    # Fallback to attached TON for wallet-originated DEX calls.
+    for a in actions:
+        if not isinstance(a, dict) or a.get("type") != "SmartContractExec":
+            continue
+        sc = a.get("SmartContractExec")
+        if not isinstance(sc, dict):
+            continue
+        ex_addr = _addr(sc.get("executor"))
+        ton_attached = _amt(sc.get("ton_attached") or sc.get("tonAttached"), 9)
+        if ex_addr and ton_attached > 0:
+            ton_spent_by[ex_addr] = max(ton_spent_by.get(ex_addr, 0.0), ton_attached)
 
+    out: List[Dict[str, Any]] = []
+    seen_buyers = set()
+    for buyer_addr, token_amount in candidates:
+        if buyer_addr in seen_buyers:
+            continue
+        seen_buyers.add(buyer_addr)
+        ton_amount = ton_spent_by.get(buyer_addr, 0.0)
+        if ton_amount <= 0:
+            continue
         out.append({
             "tx": tx_hash,
-            "buyer": buyer,
-            "ton": ton_in,
-            "token_amount": jet_out,
+            "buyer": buyer_addr,
+            "ton": ton_amount,
+            "token_amount": token_amount,
         })
-
     return out
 
 def dedust_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
@@ -5793,20 +5792,6 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         kb = build_buy_keyboard(int(dest_chat_id))
         local_msg = build_trending_channel_message() if is_trending_dest(int(dest_chat_id)) else build_group_message()
 
-        # --- Premium emoji bar for trending channel (entities-based, reliable) ---
-        if int(dest_chat_id) == int(TRENDING_CHANNEL_ID_FORCED):
-            try:
-                # reuse same strength count as message builder uses
-                strength_count = int(emoji_strength_count(buy_ton, settings))
-                bar_text, bar_entities = build_premium_bar_entities(strength_count, FORCED_CHANNEL_CUSTOM_EMOJI_ID)
-                if bar_text:
-                    await app.bot.send_message(
-                        chat_id=dest_chat_id,
-                        text=bar_text,
-                        entities=bar_entities,
-                    )
-            except Exception:
-                pass
         # Never send group buy media into the trending channel.
         if use_image and (not is_trending_dest(int(dest_chat_id))):
             if buy_media_type == "animation":
@@ -5871,8 +5856,8 @@ async def tracker_loop(app: Application):
 
 
 
-TRENDING_CHANNEL_ID_FORCED = -1002379265999
-FORCED_CHANNEL_CUSTOM_EMOJI_ID = "5188481279963715781"
+TRENDING_CHANNEL_ID_FORCED = int(os.getenv("TRENDING_CHANNEL_ID_FORCED", str(TRENDING_POST_CHAT_ID or 0)) or 0)
+FORCED_CHANNEL_CUSTOM_EMOJI_ID = str(os.getenv("FORCED_CHANNEL_CUSTOM_EMOJI_ID", "5188481279963715781"))
 
 def build_premium_bar_entities(count: int, emoji_id: str):
     """
