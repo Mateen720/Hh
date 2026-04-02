@@ -5180,8 +5180,26 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             if lv is not None:
                 liq_usd = lv
             mv = _to_float(pinfo.get("market_cap_usd"))
+            if mv is None:
+                mv = _to_float(pinfo.get("fdv_usd"))
             if mv is not None:
                 mc_usd = mv
+
+        # Extra fallback: Dexscreener pair endpoint often has fdv/marketCap
+        # even when GeckoTerminal returns a blank market cap.
+        if mc_usd is None or liq_usd is None or price_usd is None:
+            try:
+                dpair = _dex_pair_lookup(pool_for_market)
+            except Exception:
+                dpair = None
+            if isinstance(dpair, dict):
+                if price_usd is None:
+                    price_usd = _to_float(dpair.get("priceUsd") or dpair.get("price_usd"))
+                if liq_usd is None:
+                    liq = dpair.get("liquidity") or {}
+                    liq_usd = _to_float((liq.get("usd") if isinstance(liq, dict) else None) or dpair.get("liquidityUsd") or dpair.get("liquidity_usd"))
+                if mc_usd is None:
+                    mc_usd = _to_float(dpair.get("marketCap") or dpair.get("market_cap") or dpair.get("fdv") or dpair.get("fdv_usd"))
 
     if (price_usd is None or mc_usd is None) and token.get("address"):
         tinfo = gecko_token_info(token["address"])
@@ -5238,11 +5256,31 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         total_supply = None
     if total_supply is None and jetton_addr:
         try:
-            info = tonapi_jetton_info(jetton_addr)
-            for k in ("total_supply_human", "total_supply", "totalSupplyHuman"):
+            info = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton_addr}") or {}
+            meta = info.get("metadata") or {}
+            dec_raw = (meta.get("decimals") if isinstance(meta, dict) else None)
+            if dec_raw is None:
+                dec_raw = info.get("decimals")
+            try:
+                supply_decimals = int(str(dec_raw).strip()) if dec_raw is not None and str(dec_raw).strip() != "" else 9
+            except Exception:
+                supply_decimals = 9
+            for k in ("total_supply_human", "totalSupplyHuman", "total_supply"):
                 ts_h = info.get(k)
-                if ts_h is not None:
-                    total_supply = float(ts_h)
+                if ts_h is None and isinstance(meta, dict):
+                    ts_h = meta.get(k)
+                if ts_h is None:
+                    continue
+                try:
+                    ts_val = float(ts_h)
+                except Exception:
+                    continue
+                # TonAPI sometimes returns raw minimal units in total_supply.
+                # Convert only when it looks like a raw integer-like amount.
+                if k == "total_supply" and supply_decimals > 0 and ts_val > 10 ** max(supply_decimals, 6):
+                    ts_val = ts_val / (10 ** supply_decimals)
+                if ts_val > 0:
+                    total_supply = ts_val
                     token["total_supply"] = total_supply
                     break
         except Exception:
@@ -5576,8 +5614,8 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
 
         gt_link_local = gt_url or (gecko_terminal_pool_url(pair_for_links) if pair_for_links else "")
         tx_part_local = f'<a href="{h(tx_url)}">TX</a>' if tx_url else 'TX'
-        gt_part_local = f'{premium_text_or_plain("chart", "📈")} <a href="{h(gt_link_local)}">GT</a>' if gt_link_local else f'{premium_text_or_plain("chart", "📈")} GT'
-        dexs_part_local = f'<a href="{h(dex_url)}">DexS</a>' if dex_url else 'DexS'
+        gt_part_local = f'<a href="{h(gt_link_local)}">GT</a>' if gt_link_local else 'GT'
+        dexs_part_local = f'{premium_text_or_plain("chart", "📈")} <a href="{h(dex_url)}">DexS</a>' if dex_url else f'{premium_text_or_plain("chart", "📈")} DexS'
         telegram_part_local = f'{premium_text_or_plain("telegram", "📣")} <a href="{h(tg_link)}">Telegram</a>' if tg_link else f'{premium_text_or_plain("telegram", "📣")} Telegram'
         trending_part_local = f'<a href="{h(trending)}">Trending</a>' if trending else 'Trending'
         links_row_local = " | ".join([tx_part_local, gt_part_local, dexs_part_local, telegram_part_local, trending_part_local])
@@ -5639,8 +5677,9 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         else:
             header = f'{premium_text_or_plain("title", "🚀")} | <b>{h(header_token)}</b> Buy! {premium_text_or_plain("dex", "✨")}'
 
-        # Checkmark strength line (static like your example)
-        checks = "✅" * 26
+        # Strength line: use the same configured buy-strength emoji as group style,
+        # including Telegram premium emoji stored as <tg-emoji ...>.
+        checks = strength_html or ("✅" * 26)
 
         # Token amount line with 🔀 and clickable symbol (if TG exists)
         token_line = ""
