@@ -5700,9 +5700,13 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             def ce(self, name: str, plain: str):
                 ce_id, vis = _icon_meta(name, plain)
                 start = _utf16_len(self.text)
-                self.text += vis
+                # For text-only channel posts, Telegram custom emoji entities render
+                # most reliably when attached to a 1-char placeholder.
                 if MessageEntity and ce_id:
-                    self.entities.append(MessageEntity(type='custom_emoji', offset=start, length=_utf16_len(vis), custom_emoji_id=str(ce_id)))
+                    self.text += '▫'
+                    self.entities.append(MessageEntity(type='custom_emoji', offset=start, length=1, custom_emoji_id=str(ce_id)))
+                else:
+                    self.text += vis
 
             def link(self, label: str, url: str):
                 start = _utf16_len(self.text)
@@ -5763,9 +5767,11 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 n = 1
             for i in range(n):
                 start = _utf16_len(b.text)
-                b.add(vis)
                 if MessageEntity and ce_id:
-                    b.entities.append(MessageEntity(type='custom_emoji', offset=start, length=_utf16_len(vis), custom_emoji_id=str(ce_id)))
+                    b.add('▫')
+                    b.entities.append(MessageEntity(type='custom_emoji', offset=start, length=1, custom_emoji_id=str(ce_id)))
+                else:
+                    b.add(vis)
             b.nl(2)
         else:
             b.add(checks)
@@ -6003,43 +6009,16 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 )
         else:
             if is_trending_dest(int(dest_chat_id)):
-                try:
-                    tmsg, tentities = build_trending_channel_message_entities(
-                        tok_symbol=tok_symbol,
-                        title=title,
-                        tg_link=tg_link,
-                        chart_link=chart_link,
-                        strength_html=strength_html,
-                        s=s,
-                        ton_amt=ton_amt,
-                        usd_disp=usd_disp,
-                        tok_amt=tok_amt,
-                        holders=holders,
-                        buyer_short=buyer_short,
-                        buyer_url=buyer_url,
-                        change_pct=change_pct,
-                        tx_url=tx_url,
-                        price_usd=price_usd,
-                        mc_usd=mc_usd,
-                        buy_url=buy_url,
-                        ad_text=ad_text,
-                        ad_link=ad_link,
-                    )
-                    await app.bot.send_message(
-                        chat_id=dest_chat_id,
-                        text=tmsg,
-                        entities=tentities,
-                        disable_web_page_preview=True,
-                        reply_markup=kb,
-                    )
-                except Exception:
-                    await app.bot.send_message(
-                        chat_id=dest_chat_id,
-                        text=local_msg,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                        reply_markup=kb,
-                    )
+                # Use the same HTML <tg-emoji ...> rendering style as the reference Design.py
+                # and group caption flow. This keeps the channel text-only but lets Telegram
+                # render the premium icons inline for wallet / price / mcap / chart / telegram.
+                await app.bot.send_message(
+                    chat_id=dest_chat_id,
+                    text=local_msg,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=kb,
+                )
             else:
                 await app.bot.send_message(
                     chat_id=dest_chat_id,
