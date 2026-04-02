@@ -5,7 +5,7 @@ from urllib.parse import urlparse, quote
 import requests
 
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageEntity
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.error import Conflict
 from telegram.ext import (
     Application, ApplicationBuilder,
@@ -156,26 +156,6 @@ def premium_icon(name: str, fallback: str = "") -> str:
 
 def premium_text_or_plain(icon_name: str, plain: str) -> str:
     return premium_icon(icon_name, plain)
-
-def _premium_emoji_id(name: str) -> str:
-    raw = premium_icon(name, "")
-    m = re.search(r'emoji-id="(\d+)"', str(raw or ""))
-    return m.group(1) if m else ""
-
-def _append_premium_icon(parts: List[str], entities: List[MessageEntity], icon_name: str, fallback: str) -> None:
-    eid = _premium_emoji_id(icon_name)
-    if eid:
-        offset = sum(len(x) for x in parts)
-        parts.append("▫")
-        entities.append(MessageEntity(type="custom_emoji", offset=offset, length=1, custom_emoji_id=eid))
-    else:
-        parts.append(fallback)
-
-def _append_text_link(parts: List[str], entities: List[MessageEntity], label: str, url: str) -> None:
-    offset = sum(len(x) for x in parts)
-    parts.append(label)
-    if url:
-        entities.append(MessageEntity(type="text_link", offset=offset, length=len(label), url=url))
 
 # Owner-added tokens that are tracked globally (posted in the trending channel even if no group added the bot).
 # Stored by jetton master address.
@@ -5685,8 +5665,191 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         ])
         return "\n".join([b for b in blocks if b is not None])
 
+    
+
+    def _extract_custom_emoji_meta(raw: str, fallback: str = "") -> tuple[Optional[str], str]:
+        """Return (custom_emoji_id, visible_fallback_text)."""
+        raw = str(raw or "")
+        m = re.search(r'emoji-id="(\d+)"', raw)
+        inner = re.sub(r'<[^>]+>', '', raw).strip() or fallback or ''
+        return (m.group(1) if m else None), inner
+
+
+    def _utf16_len(text: str) -> int:
+        return len((text or '').encode('utf-16-le')) // 2
+
+
+    def build_trending_channel_message_entities(*, tok_symbol, title, tg_link, chart_link, strength_html, s, ton_amt, usd_disp, tok_amt, holders, buyer_short, buyer_url, change_pct, tx_url, price_usd, mc_usd, buy_url, ad_text, ad_link):
+        """Build a text-only trending channel post using proper custom emoji entities."""
+        try:
+            from telegram import MessageEntity
+        except Exception:
+            MessageEntity = None
+
+        def _icon_meta(name: str, plain: str) -> tuple[Optional[str], str]:
+            return _extract_custom_emoji_meta(premium_text_or_plain(name, plain), plain)
+
+        class _B:
+            def __init__(self):
+                self.text = ""
+                self.entities = []
+
+            def add(self, t: str):
+                self.text += str(t)
+
+            def ce(self, name: str, plain: str):
+                ce_id, vis = _icon_meta(name, plain)
+                start = _utf16_len(self.text)
+                self.text += vis
+                if MessageEntity and ce_id:
+                    self.entities.append(MessageEntity(type='custom_emoji', offset=start, length=_utf16_len(vis), custom_emoji_id=str(ce_id)))
+
+            def link(self, label: str, url: str):
+                start = _utf16_len(self.text)
+                self.text += label
+                if MessageEntity and url:
+                    self.entities.append(MessageEntity(type='text_link', offset=start, length=_utf16_len(label), url=str(url)))
+
+            def bold(self, label: str):
+                start = _utf16_len(self.text)
+                self.text += label
+                if MessageEntity:
+                    self.entities.append(MessageEntity(type='bold', offset=start, length=_utf16_len(label)))
+
+            def nl(self, n: int = 1):
+                self.text += "\n" * max(1, n)
+
+        def _fmt_compact_int(n: Optional[int]) -> str:
+            if n is None:
+                return "—"
+            try:
+                x = float(n)
+            except Exception:
+                return "—"
+            if x >= 1_000_000:
+                return f"{x/1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+            if x >= 1_000:
+                return f"{x/1_000:.2f}".rstrip("0").rstrip(".") + "K"
+            return f"{int(x):,}"
+
+        b = _B()
+
+        header_token = str(tok_symbol or title or 'TOKEN')
+        b.ce('title', '🚀')
+        b.add(' | ')
+        if tg_link:
+            b.link(header_token, tg_link)
+        elif chart_link:
+            b.link(header_token, chart_link)
+        else:
+            b.add(header_token)
+        b.add(' Buy! ')
+        b.ce('dex', '✨')
+        b.nl(2)
+
+        # Strength line: same configured emoji as group style
+        checks = strength_html or ('✅' * 26)
+        if '<tg-emoji' in checks:
+            ce_id, vis = _extract_custom_emoji_meta(str(s.get('strength_emoji') or ''), '🟢')
+            try:
+                step = float(s.get('strength_step_ton') or 5.0)
+                max_n = int(s.get('strength_max') or 30)
+                n = 1 if ton_amt > 0 else 0
+                if step > 0:
+                    effective_step = max(step, float(ton_amt) / 9.0) if ton_amt > 0 else step
+                    n = max(1, int(float(ton_amt) // effective_step))
+                n = min(max_n, max(1, n))
+            except Exception:
+                n = 1
+            for i in range(n):
+                start = _utf16_len(b.text)
+                b.add(vis)
+                if MessageEntity and ce_id:
+                    b.entities.append(MessageEntity(type='custom_emoji', offset=start, length=_utf16_len(vis), custom_emoji_id=str(ce_id)))
+            b.nl(2)
+        else:
+            b.add(checks)
+            b.nl(2)
+
+        b.ce('spent', '💎'); b.add(f' {ton_amt:,.2f} TON{usd_disp}')
+        b.nl()
+
+        if tok_amt and tok_symbol:
+            b.ce('got', '🪙'); b.add(' ')
+            try:
+                amt_label = fmt_token_amount(float(tok_amt))
+            except Exception:
+                amt_label = str(tok_amt)
+            b.add(f'{amt_label} ')
+            if tg_link:
+                b.link(str(tok_symbol), tg_link)
+            else:
+                b.add(str(tok_symbol))
+            b.nl()
+
+        b.ce('holders', '👥'); b.add(f' {_fmt_compact_int(int(holders) if holders is not None else None)} Holders')
+        b.nl()
+
+        b.ce('wallet', '👛'); b.add(' ')
+        if buyer_url:
+            b.link(str(buyer_short), buyer_url)
+        else:
+            b.add(str(buyer_short))
+        if isinstance(change_pct, (int, float)):
+            try:
+                v = float(change_pct)
+                sign = '+' if v > 0 else ''
+                b.add(f': {sign}{v:.1f}%')
+            except Exception:
+                pass
+        b.add(' | ')
+        if tx_url:
+            b.link('Txn', tx_url)
+        else:
+            b.add('Txn')
+        b.nl()
+
+        b.ce('price', '💵')
+        if price_usd is not None:
+            try:
+                b.add(f' Price: ${float(price_usd):,.6f}')
+            except Exception:
+                b.add(' Price: —')
+        else:
+            b.add(' Price: —')
+        b.nl()
+
+        b.ce('mcap', '📊'); b.add(f' MarketCap: {fmt_usd(mc_usd, 0) or "—"}')
+        b.nl(2)
+
+        b.ce('spent', '💎'); b.add(' ')
+        if LISTING_URL:
+            b.link('Listing', LISTING_URL)
+        else:
+            b.add('Listing')
+        b.add(' | ')
+        b.ce('buy', '🛒'); b.add(' ')
+        if buy_url:
+            b.link('Buy', buy_url)
+        else:
+            b.add('Buy')
+        b.add(' | ')
+        b.ce('chart', '📈'); b.add(' ')
+        if chart_link:
+            b.link('Chart', chart_link)
+        else:
+            b.add('Chart')
+        b.nl()
+        b.add('ad: ')
+        if ad_link:
+            b.link(str(ad_text), ad_link)
+        else:
+            b.add(str(ad_text))
+
+        return b.text, b.entities
     def build_trending_channel_message() -> str:
         """Trending channel style (only). Keeps all clickable links, but uses the requested layout."""
+        # Header: | TOKEN Buy! (TOKEN clickable to Telegram when available)
         header_token = tok_symbol or title
         if tg_link:
             header = f'{premium_text_or_plain("title", "🚀")} | <a href="{h(tg_link)}"><b>{h(header_token)}</b></a> Buy! {premium_text_or_plain("dex", "✨")}'
@@ -5695,8 +5858,23 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         else:
             header = f'{premium_text_or_plain("title", "🚀")} | <b>{h(header_token)}</b> Buy! {premium_text_or_plain("dex", "✨")}'
 
+        # Strength line: use the same configured buy-strength emoji as group style,
+        # including Telegram premium emoji stored as <tg-emoji ...>.
         checks = strength_html or ("✅" * 26)
 
+        # Token amount line with 🔀 and clickable symbol (if TG exists)
+        token_line = ""
+        if tok_amt and tok_symbol:
+            sym_html = h(tok_symbol)
+            if tg_link:
+                sym_html = f'<a href="{h(tg_link)}">{h(tok_symbol)}</a>'
+            try:
+                tok_amt_f = float(tok_amt)
+                token_line = f'{premium_text_or_plain("got", "🪙")} <b>{h(fmt_token_amount(tok_amt_f))} {sym_html}</b>'
+            except Exception:
+                token_line = f'{premium_text_or_plain("got", "🪙")} <b>{h(tok_amt)} {sym_html}</b>'
+
+        # Holders compact (1.17K, 2.3M)
         def _fmt_compact_int(n: Optional[int]) -> str:
             if n is None:
                 return "—"
@@ -5713,6 +5891,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         holders_compact = _fmt_compact_int(int(holders) if holders is not None else None)
         holders_line_ch = f"{premium_text_or_plain('holders', '👥')} {h(holders_compact)} Holders"
 
+        # Buyer line (wallet clickable) + change % (h6/h1) + Txn clickable
         buyer_html2 = h(buyer_short)
         if buyer_url:
             buyer_html2 = f'<a href="{h(buyer_url)}">{buyer_html2}</a>'
@@ -5727,6 +5906,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         txn_part = f' | <a href="{h(tx_url)}">Txn</a>' if tx_url else " | Txn"
         buyer_line_ch = f"{premium_text_or_plain('wallet', '👛')} {buyer_html2}{pct_part}{txn_part}"
 
+        # Price + MarketCap
         price_line = f"{premium_text_or_plain('price', '💵')} Price: —"
         if price_usd is not None:
             try:
@@ -5735,152 +5915,28 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 price_line = f"{premium_text_or_plain('price', '💵')} Price: —"
         mc_line_ch = f"{premium_text_or_plain('mcap', '📊')} MarketCap: {h(fmt_usd(mc_usd, 0) or '—')}"
 
+        # Links row: Listing | Buy | Chart (all clickable)
         listing_part = f'{premium_text_or_plain("spent", "💎")} <a href="{h(LISTING_URL)}">Listing</a>' if LISTING_URL else f'{premium_text_or_plain("spent", "💎")} Listing'
         buy_part = f'{premium_text_or_plain("buy", "🛒")} <a href="{h(buy_url)}">Buy</a>' if buy_url else f'{premium_text_or_plain("buy", "🛒")} Buy'
         chart_part = f'{premium_text_or_plain("chart", "📈")} <a href="{h(chart_link)}">Chart</a>' if chart_link else f'{premium_text_or_plain("chart", "📈")} Chart'
         links_row = " | ".join([p for p in [listing_part, buy_part, chart_part] if p])
 
-        blocks: List[str] = [header, "", checks, "", f" {premium_text_or_plain('spent', '💎')}  {ton_amt:,.2f} TON{h(usd_disp)}"]
-        if tok_amt and tok_symbol:
-            sym_html = h(tok_symbol)
-            if tg_link:
-                sym_html = f'<a href="{h(tg_link)}">{h(tok_symbol)}</a>'
-            try:
-                tok_amt_f = float(tok_amt)
-                blocks.append(f'{premium_text_or_plain("got", "🪙")} <b>{h(fmt_token_amount(tok_amt_f))} {sym_html}</b>')
-            except Exception:
-                blocks.append(f'{premium_text_or_plain("got", "🪙")} <b>{h(tok_amt)} {sym_html}</b>')
-        blocks.extend([holders_line_ch, buyer_line_ch, price_line, mc_line_ch, "", links_row, ad_line])
+        blocks: List[str] = []
+        blocks.append(header)
+        blocks.append("")
+        blocks.append(checks)
+        blocks.append("")
+        blocks.append(f" {premium_text_or_plain('spent', '💎')}  {ton_amt:,.2f} TON{h(usd_disp)}")
+        if token_line:
+            blocks.append(token_line)
+        blocks.append(holders_line_ch)
+        blocks.append(buyer_line_ch)
+        blocks.append(price_line)
+        blocks.append(mc_line_ch)
+        blocks.append("")
+        blocks.append(links_row)
+        blocks.append(ad_line)
         return "\n".join([b for b in blocks if b is not None])
-
-    def build_trending_channel_entities_message() -> Tuple[str, List[MessageEntity]]:
-        """Trending channel text rendered with actual custom emoji entities so premium icons work in channels."""
-        parts: List[str] = []
-        entities: List[MessageEntity] = []
-
-        def add(txt: str = ""):
-            parts.append(txt)
-
-        header_token = (tok_symbol or title or "TOKEN").strip()
-        _append_premium_icon(parts, entities, "title", "🚀")
-        add(" | ")
-        header_url = tg_link or chart_link or ""
-        if header_url:
-            _append_text_link(parts, entities, header_token, header_url)
-        else:
-            add(header_token)
-        add(" Buy! ")
-        _append_premium_icon(parts, entities, "dex", "✨")
-        add("\n\n")
-
-        strength_raw = str(s.get("strength_emoji") or "🟢")
-        try:
-            step = float(s.get("strength_step_ton") or 5.0)
-            max_n = int(s.get("strength_max") or 30)
-            n = 1 if ton_amt > 0 else 0
-            if step > 0:
-                effective_step = max(step, float(ton_amt) / 9.0) if ton_amt > 0 else step
-                n = max(1, int(float(ton_amt) // effective_step))
-            n = min(max_n, max(1, n))
-        except Exception:
-            n = 8
-        m = re.search(r'emoji-id="(\d+)"', strength_raw)
-        if m:
-            for i in range(n):
-                off = sum(len(x) for x in parts)
-                add("▫")
-                entities.append(MessageEntity(type="custom_emoji", offset=off, length=1, custom_emoji_id=m.group(1)))
-            add("\n\n")
-        else:
-            add((strength_raw or "🟢") * n)
-            add("\n\n")
-
-        _append_premium_icon(parts, entities, "spent", "💎")
-        add(f" {ton_amt:,.2f} TON{usd_disp}\n")
-
-        if tok_amt and tok_symbol:
-            _append_premium_icon(parts, entities, "got", "🪙")
-            try:
-                token_amount_txt = fmt_token_amount(float(tok_amt))
-            except Exception:
-                token_amount_txt = str(tok_amt)
-            add(f" {token_amount_txt} ")
-            if tg_link:
-                _append_text_link(parts, entities, str(tok_symbol), tg_link)
-            else:
-                add(str(tok_symbol))
-            add("\n")
-
-        def _fmt_compact_int(n: Optional[int]) -> str:
-            if n is None:
-                return "—"
-            try:
-                x = float(n)
-            except Exception:
-                return "—"
-            if x >= 1_000_000:
-                return f"{x/1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
-            if x >= 1_000:
-                return f"{x/1_000:.2f}".rstrip("0").rstrip(".") + "K"
-            return f"{int(x):,}"
-
-        _append_premium_icon(parts, entities, "holders", "👥")
-        add(f" {_fmt_compact_int(int(holders) if holders is not None else None)} Holders\n")
-
-        _append_premium_icon(parts, entities, "wallet", "👛")
-        if buyer_url:
-            _append_text_link(parts, entities, buyer_short, buyer_url)
-        else:
-            add(buyer_short)
-        if isinstance(change_pct, (int, float)):
-            try:
-                v = float(change_pct)
-                sign = "+" if v > 0 else ""
-                add(f": {sign}{v:.1f}%")
-            except Exception:
-                pass
-        add(" | ")
-        if tx_url:
-            _append_text_link(parts, entities, "Txn", tx_url)
-        else:
-            add("Txn")
-        add("\n")
-
-        _append_premium_icon(parts, entities, "price", "💵")
-        try:
-            add(f" Price: ${float(price_usd):,.6f}\n" if price_usd is not None else " Price: —\n")
-        except Exception:
-            add(" Price: —\n")
-
-        _append_premium_icon(parts, entities, "mcap", "📊")
-        add(f" MarketCap: {fmt_usd(mc_usd, 0) or '—'}\n\n")
-
-        _append_premium_icon(parts, entities, "spent", "💎")
-        add(" ")
-        if LISTING_URL:
-            _append_text_link(parts, entities, "Listing", LISTING_URL)
-        else:
-            add("Listing")
-        add(" | ")
-        _append_premium_icon(parts, entities, "buy", "🛒")
-        add(" ")
-        if buy_url:
-            _append_text_link(parts, entities, "Buy", buy_url)
-        else:
-            add("Buy")
-        add(" | ")
-        _append_premium_icon(parts, entities, "chart", "📈")
-        add(" ")
-        if chart_link:
-            _append_text_link(parts, entities, "Chart", chart_link)
-        else:
-            add("Chart")
-        add("\n")
-        add(f"ad: {ad_text}")
-        if ad_link:
-            off = len("".join(parts)) - len(ad_text)
-            entities.append(MessageEntity(type="text_link", offset=off, length=len(ad_text), url=ad_link))
-        return "".join(parts), entities
     def is_trending_dest(dest_chat_id: int) -> bool:
         return bool(TRENDING_POST_CHAT_ID and str(dest_chat_id) == str(TRENDING_POST_CHAT_ID))
 
@@ -5947,15 +6003,43 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 )
         else:
             if is_trending_dest(int(dest_chat_id)):
-                # Channel posts: use the same HTML tg-emoji rendering style as the group buy card.
-                # This keeps the premium emoji identical to the group style and avoids square placeholders.
-                await app.bot.send_message(
-                    chat_id=dest_chat_id,
-                    text=local_msg,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                    reply_markup=kb,
-                )
+                try:
+                    tmsg, tentities = build_trending_channel_message_entities(
+                        tok_symbol=tok_symbol,
+                        title=title,
+                        tg_link=tg_link,
+                        chart_link=chart_link,
+                        strength_html=strength_html,
+                        s=s,
+                        ton_amt=ton_amt,
+                        usd_disp=usd_disp,
+                        tok_amt=tok_amt,
+                        holders=holders,
+                        buyer_short=buyer_short,
+                        buyer_url=buyer_url,
+                        change_pct=change_pct,
+                        tx_url=tx_url,
+                        price_usd=price_usd,
+                        mc_usd=mc_usd,
+                        buy_url=buy_url,
+                        ad_text=ad_text,
+                        ad_link=ad_link,
+                    )
+                    await app.bot.send_message(
+                        chat_id=dest_chat_id,
+                        text=tmsg,
+                        entities=tentities,
+                        disable_web_page_preview=True,
+                        reply_markup=kb,
+                    )
+                except Exception:
+                    await app.bot.send_message(
+                        chat_id=dest_chat_id,
+                        text=local_msg,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        reply_markup=kb,
+                    )
             else:
                 await app.bot.send_message(
                     chat_id=dest_chat_id,
