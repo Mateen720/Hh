@@ -1689,6 +1689,22 @@ TON_PRICE_CACHE: Dict[str, Any] = {"ts": 0, "usd": None}
 
 BOT_USERNAME_CACHE = None
 
+OLD_BUY_MAX_AGE_SECONDS = int(os.getenv("OLD_BUY_MAX_AGE_SECONDS", "180") or "180")
+
+def _is_stale_post(ts_value: Any, max_age: int | None = None) -> bool:
+    try:
+        ts_i = int(float(ts_value or 0))
+    except Exception:
+        return False
+    if ts_i <= 0:
+        return False
+    if ts_i > 10_000_000_000:
+        ts_i //= 1000
+    age_cap = int(max_age or OLD_BUY_MAX_AGE_SECONDS or 0)
+    if age_cap <= 0:
+        return False
+    return ts_i < int(time.time()) - age_cap
+
 async def get_bot_username(bot):
     global BOT_USERNAME_CACHE
     if BOT_USERNAME_CACHE:
@@ -4670,6 +4686,8 @@ async def poll_once(app: Application):
                     ev_ts = int(ev.get("timestamp") or ev.get("time") or ev.get("ts") or 0)
                     if ignore_before and ev_ts and ev_ts < ignore_before:
                         continue
+                    if _is_stale_post(ev_ts):
+                        continue
                     pair_id = str(ev.get("pairId") or "").strip()
                     if pair_id != pool:
                         continue
@@ -4711,6 +4729,8 @@ async def poll_once(app: Application):
                             ignore_before = int(token.get("ignore_before_ts") or 0)
                             ut = int(txo.get("utime") or 0)
                             if ignore_before and ut and ut < ignore_before:
+                                continue
+                            if _is_stale_post(ut):
                                 continue
                             buys = stonfi_extract_buys_from_tonapi_tx(txo, token["address"])
                             for b in buys:
@@ -4816,6 +4836,8 @@ async def poll_once(app: Application):
                     # ignore old history right after token added
                     if ignore_before and ts_i and ts_i < ignore_before:
                         continue
+                    if _is_stale_post(ts_i):
+                        continue
 
                     is_new = False
                     if lt_i and last_lt:
@@ -4901,6 +4923,8 @@ async def poll_once(app: Application):
                                     if last_ets and ts and ts <= last_ets:
                                         continue
                                     if ignore_before and ts and ts < ignore_before:
+                                        continue
+                                    if _is_stale_post(ts):
                                         continue
                                     new_events.append(ev)
                 
@@ -5002,6 +5026,8 @@ async def poll_once(app: Application):
                                 continue
                             if ignore_before and ts and ts < ignore_before:
                                 continue
+                            if _is_stale_post(ts):
+                                continue
                             new_events.append(ev)
 
                         for ev in reversed(new_events):
@@ -5076,6 +5102,8 @@ async def poll_once(app: Application):
                         if last_lt and lt0 and lt0 == last_lt:
                             break
                         if ignore_before and uts0 and uts0 < ignore_before:
+                            continue
+                        if _is_stale_post(uts0):
                             continue
                         new_txs.append(txo)
 
