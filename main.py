@@ -5,7 +5,7 @@ from urllib.parse import urlparse, quote
 import requests
 
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageEntity
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.error import Conflict
 from telegram.ext import (
     Application, ApplicationBuilder,
@@ -24,7 +24,7 @@ log = logging.getLogger("spyton_public")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
-POLL_INTERVAL = max(0.20, float(os.getenv("POLL_INTERVAL", "0.25")))
+POLL_INTERVAL = max(0.35, float(os.getenv("POLL_INTERVAL", "0.45")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/KYRONTrending").strip()
@@ -67,7 +67,7 @@ TRENDING_MIN_BUY_TON = float(os.getenv("TRENDING_MIN_BUY_TON", "5").strip() or 5
 # Owner-only Ads system
 OWNER_IDS = [int(x) for x in re.split(r"[ ,;]+", os.getenv("OWNER_IDS", "").strip()) if x.strip().isdigit()]
 ADS_FILE = _data_path(os.getenv("ADS_FILE", "ads_public.json"))
-DEFAULT_AD_TEXT = os.getenv("DEFAULT_AD_TEXT", "Advertise here").strip()
+DEFAULT_AD_TEXT = os.getenv("DEFAULT_AD_TEXT", "Рекламируйтесь здесь с KYRON Ads").strip()
 DEFAULT_AD_LINK = os.getenv("DEFAULT_AD_LINK", "https://t.me/vseeton").strip()
 GECKO_BASE = os.getenv("GECKO_BASE", "https://api.geckoterminal.com/api/v2").strip().rstrip("/")
 BLUM_BONDING_CAP_TON = float(os.getenv("BLUM_BONDING_CAP_TON", "1500").strip() or 1500)
@@ -136,19 +136,19 @@ USER_PREFS_FILE = _data_path(os.getenv("USER_PREFS_FILE", "user_prefs_public.jso
 PREMIUM_EMOJI_DEFAULTS = {
     "title": '<tg-emoji emoji-id="5260547274957672345">🛡️</tg-emoji>',
     "dex": '<tg-emoji emoji-id="5321530952952860238">✨</tg-emoji>',
-    "spent": '<tg-emoji emoji-id="5283131437065708497">💎</tg-emoji>',
-    "got": '<tg-emoji emoji-id="5893224751119208859">🪙</tg-emoji>',
-    "wallet": '<tg-emoji emoji-id="5260547274957672345">👛</tg-emoji>',
-    "price": '<tg-emoji emoji-id="5224257782013769471">💵</tg-emoji>',
-    "mcap": '<tg-emoji emoji-id="5451882707875276247">📊</tg-emoji>',
+    "spent": '<tg-emoji emoji-id="5283131437065708497">💲</tg-emoji>',
+    "got": '<tg-emoji emoji-id="5893224751119208859">↔️</tg-emoji>',
+    "wallet": '<tg-emoji emoji-id="5260547274957672345">🛡️</tg-emoji>',
+    "price": '<tg-emoji emoji-id="5224257782013769471">🗝️</tg-emoji>',
+    "mcap": '<tg-emoji emoji-id="5451882707875276247">📈</tg-emoji>',
     "telegram": '<tg-emoji emoji-id="5350291836378307462">📣</tg-emoji>',
     "chart": '<tg-emoji emoji-id="5417971815064561628">🛡️</tg-emoji>',
-    "holders": '<tg-emoji emoji-id="5317058732356542197">👥</tg-emoji>',
-    "liquidity": '<tg-emoji emoji-id="5078256394625352692">💧</tg-emoji>',
+    "holders": '<tg-emoji emoji-id="5317058732356542197">🫂</tg-emoji>',
+    "liquidity": '<tg-emoji emoji-id="5350678520873900050">💧</tg-emoji>',
+    "buy": '<tg-emoji emoji-id="5426848653471939502">🛒</tg-emoji>',
     "listing": '<tg-emoji emoji-id="5424912684078348533">🔥</tg-emoji>',
-    "buy": '<tg-emoji emoji-id="5352784961814405440">🐸</tg-emoji>',
+    "trade": '<tg-emoji emoji-id="5352784961814405440">🐸</tg-emoji>',
 }
-
 def premium_icon(name: str, fallback: str = "") -> str:
     raw = os.getenv(f"PREMIUM_EMOJI_{name.upper()}", "").strip()
     if raw:
@@ -1338,7 +1338,7 @@ I18N: Dict[str, Dict[str, str]] = {
     "lang_en": "🇬🇧 English",
     "lang_ru": "🇷🇺 Russian",
     "start_title": "🚀 *KYRON BuyBot*",
-    "start_desc": "Premium buy alerts for STON.fi + DeDust on TON.\n\n• Add to your group\n• Configure token in seconds\n• Clean buy posts + ads support\n\nUse the buttons below:",
+    "start_desc": "Premium buy alerts for STON.fi + DeDust + Groypad launches (TON).\n\n• Add to a group\n• Configure token in 10 seconds\n• Clean buy posts + ads support\n\nUse the buttons below:",
     "connected_title": "✅ *KYRON BuyBot connected*",
     "connected_desc": "Now send the token CA here in DM.\nI will auto-detect *STON.fi* / *DeDust* pools and also watch *Groypad* launchpad flow when no pool is live yet, then start posting buys in your group.\n\nTip: you can also include the token Telegram link in the same message.\nExample:\n`<CA> https://t.me/YourToken`",
     "lang_set_ok": "Language saved: English ✅",
@@ -1373,7 +1373,7 @@ I18N: Dict[str, Dict[str, str]] = {
     "lang_en": "🇬🇧 English",
     "lang_ru": "🇷🇺 Русский",
     "start_title": "🚀 *KYRON BuyBot*",
-    "start_desc": "Премиум-уведомления о покупках для STON.fi + DeDust в TON.\n\n• Добавьте в свою группу\n• Настройте токен за секунды\n• Чистые buy-посты + поддержка рекламы\n\nИспользуйте кнопки ниже:",
+    "start_desc": "Премиум-уведомления о покупках для STON.fi + DeDust + запусков Groypad (TON).\n\n• Добавьте в группу\n• Настройте токен за 10 секунд\n• Чистые buy-посты + поддержка рекламы\n\nИспользуйте кнопки ниже:",
     "connected_title": "✅ *KYRON BuyBot подключён*",
     "connected_desc": "Теперь отправьте сюда в ЛС адрес токена (CA).\nЯ автоматически найду пулы *STON.fi* / *DeDust* и также буду отслеживать launchpad *Groypad*, если пул ещё не запущен, после чего начну постить покупки в вашей группе.\n\nСовет: можно добавить ссылку на Telegram токена в том же сообщении.\nПример:\n`<CA> https://t.me/YourToken`",
     "lang_set_ok": "Язык сохранён: English ✅",
@@ -1650,45 +1650,6 @@ def active_ad() -> Tuple[str, str, int]:
 
 # -------------------- CACHES --------------------
 TX_LT_CACHE: Dict[str, Tuple[int, str]] = {}  # key=f"{account}:{lt}" -> (ts, hash)
-
-def _safe_ts(v: Any) -> int:
-    try:
-        ts = int(float(v or 0))
-    except Exception:
-        ts = 0
-    if ts > 10_000_000_000:
-        ts //= 1000
-    return max(ts, 0)
-
-def _tx_lt_int(tx: Dict[str, Any]) -> int:
-    if not isinstance(tx, dict):
-        return 0
-    tid = tx.get("transaction_id") or {}
-    for cand in (tx.get("lt"), tid.get("lt")):
-        try:
-            return int(str(cand).strip())
-        except Exception:
-            pass
-    return 0
-
-def _tx_sort_key(tx: Dict[str, Any]) -> tuple[int, int]:
-    if not isinstance(tx, dict):
-        return (0, 0)
-    ts = _safe_ts(tx.get("utime") or tx.get("now") or tx.get("timestamp") or tx.get("tx_time") or tx.get("time"))
-    return (ts, _tx_lt_int(tx))
-
-def _event_sort_key(ev: Dict[str, Any]) -> tuple[int, int]:
-    if not isinstance(ev, dict):
-        return (0, 0)
-    ts = _safe_ts(ev.get("timestamp") or ev.get("utime") or ev.get("time") or ev.get("ts"))
-    rank = 0
-    for cand in (ev.get("lt"), ev.get("event_id"), ev.get("id")):
-        try:
-            rank = int(str(cand).strip())
-            break
-        except Exception:
-            continue
-    return (ts, rank)
 MARKET_CACHE: Dict[str, Dict[str, Any]] = {}  # key=pool or token -> {ts, price_usd, liq_usd, mc_usd, holders}
 
 # Jetton metadata cache (decimals/symbol/name) to fix wrong amounts from some DEX APIs
@@ -1729,110 +1690,6 @@ TON_PRICE_CACHE: Dict[str, Any] = {"ts": 0, "usd": None}
 
 BOT_USERNAME_CACHE = None
 
-OLD_BUY_MAX_AGE_SECONDS = int(os.getenv("OLD_BUY_MAX_AGE_SECONDS", "120") or "120")
-TX_META_CACHE: Dict[str, Any] = {}
-
-def _is_stale_post(ts_value: Any, max_age: int | None = None) -> bool:
-    try:
-        ts_i = int(float(ts_value or 0))
-    except Exception:
-        return False
-    if ts_i <= 0:
-        return False
-    if ts_i > 10_000_000_000:
-        ts_i //= 1000
-    age_cap = int(max_age or OLD_BUY_MAX_AGE_SECONDS or 0)
-    if age_cap <= 0:
-        return False
-    return ts_i < int(time.time()) - age_cap
-
-def tonapi_recent_tx_meta(address: str, limit: int = 40, ttl: int = 20) -> Dict[str, Dict[str, Any]]:
-    """Recent tx metadata cache keyed by normalized tx hash."""
-    addr = str(address or '').strip()
-    if not addr:
-        return {}
-    now = int(time.time())
-    ck = f"{addr}:{int(limit or 40)}"
-    cached = TX_META_CACHE.get(ck)
-    if isinstance(cached, dict) and now - int(cached.get('ts') or 0) < max(int(ttl or 20), 1):
-        data = cached.get('data')
-        return data if isinstance(data, dict) else {}
-    out: Dict[str, Dict[str, Any]] = {}
-    try:
-        for tx in tonapi_account_transactions(addr, int(limit or 40)):
-            if not isinstance(tx, dict):
-                continue
-            h = _normalize_tx_hash_to_hex(_tx_hash(tx) or tx.get('hash') or tx.get('id') or '')
-            if not h:
-                continue
-            ts = 0
-            for k in ('utime', 'now', 'timestamp', 'tx_time', 'time'):
-                try:
-                    v = tx.get(k)
-                    if v is None:
-                        continue
-                    ts = int(float(v or 0))
-                    break
-                except Exception:
-                    pass
-            if ts > 10_000_000_000:
-                ts //= 1000
-            failed = False
-            try:
-                if tx.get('success') is False or tx.get('aborted') is True:
-                    failed = True
-            except Exception:
-                pass
-            try:
-                desc = tx.get('description') or {}
-                if isinstance(desc, dict):
-                    if desc.get('aborted') is True or str(desc.get('type') or '').lower() == 'aborted':
-                        failed = True
-                    action_phase = desc.get('action_phase') or desc.get('actionPhase') or {}
-                    if isinstance(action_phase, dict) and action_phase.get('success') is False:
-                        failed = True
-                    compute_phase = desc.get('compute_phase') or desc.get('computePhase') or {}
-                    if isinstance(compute_phase, dict) and compute_phase.get('success') is False:
-                        failed = True
-            except Exception:
-                pass
-            out[h] = {'ts': int(ts or 0), 'failed': bool(failed)}
-    except Exception:
-        out = {}
-    TX_META_CACHE[ck] = {'ts': now, 'data': out}
-    return out
-
-def should_skip_by_tx_meta(account_addr: str, tx_hash: Any, fallback_ts: Any = 0, ignore_before: int = 0) -> tuple[bool, int]:
-    """Return (skip, resolved_ts).
-
-    Prefer recent TonAPI tx metadata when available. If the tx is not found there and
-    we also do not have a usable timestamp from the trade/event itself, skip it to avoid
-    replaying stale history after restarts.
-    """
-    resolved_ts = 0
-    try:
-        resolved_ts = int(float(fallback_ts or 0))
-    except Exception:
-        resolved_ts = 0
-    if resolved_ts > 10_000_000_000:
-        resolved_ts //= 1000
-    h = _normalize_tx_hash_to_hex(tx_hash)
-    meta = tonapi_recent_tx_meta(account_addr, 40, 20) if account_addr else {}
-    info = meta.get(h) if h else None
-    if isinstance(info, dict):
-        mts = int(info.get('ts') or 0)
-        if mts > 0:
-            resolved_ts = mts
-        if bool(info.get('failed')):
-            return True, resolved_ts
-    elif h and not resolved_ts:
-        return True, 0
-    if ignore_before and resolved_ts and resolved_ts < int(ignore_before or 0):
-        return True, resolved_ts
-    if _is_stale_post(resolved_ts):
-        return True, resolved_ts
-    return False, resolved_ts
-
 async def get_bot_username(bot):
     global BOT_USERNAME_CACHE
     if BOT_USERNAME_CACHE:
@@ -1847,12 +1704,11 @@ async def stonfi_latest_swaps(pool: str, limit: int = 25) -> List[Dict[str, Any]
     This is used only to avoid posting old buys right after configuration."""
     try:
         txs = await _to_thread(tonapi_account_transactions, pool, int(limit))
-        txs = sorted([x for x in (txs or []) if isinstance(x, dict)], key=_tx_sort_key, reverse=True)
         out = []
-        for txo in txs:
+        for txo in txs or []:
             h = _tx_hash(txo)
             if h:
-                out.append({"hash": h, "utime": _safe_ts(txo.get("utime") or txo.get("now") or txo.get("timestamp")), "lt": str(txo.get("lt") or ((txo.get("transaction_id") or {}).get("lt") or ""))})
+                out.append({"hash": h})
         return out
     except Exception:
         return []
@@ -1876,10 +1732,6 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
         newest_blum_tx = None
         newest_blum_lt = None
         blum_progress_ton = None
-        blum_event_map: Dict[str, str] = {}
-        blum_event_ts_map: Dict[str, int] = {}
-        blum_tx_map: Dict[str, str] = {}
-        blum_lt_map: Dict[str, str] = {}
 
         # STON.fi (warmup by pool tx hashes from TonAPI)
         if ston_pool:
@@ -1953,16 +1805,12 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                 for watch_addr0 in launchpad_watch_addresses(tok0):
                     evs = await _to_thread(tonapi_account_events, watch_addr0, BLUM_EVENT_LIMIT)
                     if isinstance(evs, list) and evs:
-                        evs = sorted([x for x in evs if isinstance(x, dict)], key=_event_sort_key, reverse=True)
                         newest = evs[0]
-                        newest_eid0 = str(newest.get("event_id") or newest.get("id") or "").strip()
-                        newest_ts0 = _safe_ts(newest.get("timestamp") or newest.get("utime") or newest.get("time") or newest.get("ts"))
-                        if newest_eid0:
-                            blum_event_map[watch_addr0] = newest_eid0
-                            newest_blum_eid = newest_eid0 or newest_blum_eid
-                        if newest_ts0:
-                            blum_event_ts_map[watch_addr0] = newest_ts0
-                            newest_blum_ts = newest_ts0 or newest_blum_ts
+                        newest_blum_eid = str(newest.get("event_id") or newest.get("id") or "").strip() or newest_blum_eid
+                        try:
+                            newest_blum_ts = int(newest.get("timestamp") or 0) or newest_blum_ts
+                        except Exception:
+                            pass
                         for ev in reversed(evs):
                             buys = blum_extract_buys_from_tonapi_event(ev, tok0.get("address"))
                             for b in buys:
@@ -1972,16 +1820,9 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                                     pass
                     txs = await _to_thread(tonapi_account_transactions, watch_addr0, BLUM_TX_LIMIT)
                     if isinstance(txs, list) and txs:
-                        txs = sorted([x for x in txs if isinstance(x, dict)], key=_tx_sort_key, reverse=True)
                         newest_tx0 = txs[0]
-                        newest_txh0 = str(_tx_hash(newest_tx0) or "").strip()
-                        newest_lt0 = str(newest_tx0.get("lt") or ((newest_tx0.get("transaction_id") or {}).get("lt") or "")).strip()
-                        if newest_txh0:
-                            blum_tx_map[watch_addr0] = newest_txh0
-                            newest_blum_tx = newest_txh0 or newest_blum_tx
-                        if newest_lt0:
-                            blum_lt_map[watch_addr0] = newest_lt0
-                            newest_blum_lt = newest_lt0 or newest_blum_lt
+                        newest_blum_tx = str(_tx_hash(newest_tx0) or "").strip() or newest_blum_tx
+                        newest_blum_lt = str(newest_tx0.get("lt") or "").strip() or newest_blum_lt
                         if total_ton <= 0:
                             for txo in reversed(txs):
                                 buys = blum_extract_buys_from_tonapi_tx(txo, tok0.get("address"))
@@ -2013,14 +1854,6 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                 tok["last_blum_tx"] = newest_blum_tx
             if newest_blum_lt:
                 tok["last_blum_lt"] = newest_blum_lt
-            if blum_event_map:
-                tok["last_blum_event_by_watch"] = blum_event_map
-            if blum_event_ts_map:
-                tok["last_blum_event_ts_by_watch"] = blum_event_ts_map
-            if blum_tx_map:
-                tok["last_blum_tx_by_watch"] = blum_tx_map
-            if blum_lt_map:
-                tok["last_blum_lt_by_watch"] = blum_lt_map
             if blum_progress_ton is not None:
                 tok["blum_progress_ton"] = round(float(blum_progress_ton), 6)
                 try:
@@ -2633,124 +2466,125 @@ def _to_float(x) -> float:
         return 0.0
 
 def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
-    """Conservative STON.fi buy parser from TonAPI tx actions.
-
-    Important: pool-account TonAPI swap actions can be rendered from the pool's point of
-    view, which can make sells look like buys if we trust only `asset_in/asset_out`.
-    To avoid posting sells as buys, we only emit a buy when we can correlate BOTH:
-      1) target jetton transferred OUT to an end-user wallet, and
-      2) TON spent BY that same wallet in the same transaction/event.
+    """Heuristic buy parser from TonAPI tx actions.
+    BUY = TON -> token_addr.
     """
-    if not isinstance(tx, dict):
-        return []
-
+    out: List[Dict[str, Any]] = []
     tx_hash = _tx_hash(tx)
+
     actions = tx.get("actions")
     if not isinstance(actions, list):
         actions = []
 
-    def _addr(v: Any) -> str:
-        if isinstance(v, dict):
-            return str(v.get("address") or v.get("account") or v.get("wallet") or "").strip()
-        return str(v or "").strip()
-
-    def _amt(raw: Any, decimals: int = 9) -> float:
-        s = str(raw or "").strip()
-        if not s:
-            return 0.0
-        try:
-            if s.replace('-', '').isdigit():
-                return int(s) / (10 ** max(int(decimals or 0), 0))
-            return float(s)
-        except Exception:
-            return 0.0
-
-    token_decimals = 9
-    try:
-        token_decimals = int(get_jetton_meta(token_addr).get("decimals") or 9)
-    except Exception:
-        token_decimals = 9
-
-    # Candidate token transfers OUT to user wallets.
-    candidates: List[Tuple[str, float]] = []
     for a in actions:
         if not isinstance(a, dict):
             continue
-        if a.get("type") != "JettonTransfer":
-            continue
-        jt = a.get("JettonTransfer")
-        if not isinstance(jt, dict):
-            continue
-        jetton = jt.get("jetton") or {}
-        jetton_addr = _addr(jetton) or str(jetton.get("master") or jetton.get("jetton_master") or "").strip()
-        if jetton_addr != token_addr:
+        payload = a.get(a.get('type') or a.get('action') or a.get('name'))
+        aa = dict(a)
+        if isinstance(payload, dict):
+            aa.update(payload)
+
+        at = _action_type(aa).lower()
+        if "swap" not in at and "dex" not in at:
             continue
 
-        recipient = _addr(jt.get("recipient"))
-        sender = _addr(jt.get("sender"))
-        if not recipient or recipient == sender or recipient == token_addr:
+        dex = aa.get("dex")
+        dex_name = ""
+        if isinstance(dex, dict):
+            dex_name = str(dex.get("name") or dex.get("title") or dex.get("id") or "").lower()
+        if dex_name and "ston" not in dex_name:
             continue
 
-        dec = token_decimals
-        try:
-            if isinstance(jetton, dict) and jetton.get("decimals") is not None:
-                dec = int(jetton.get("decimals") or token_decimals)
-        except Exception:
-            dec = token_decimals
+        in_asset = aa.get("asset_in") or aa.get("assetIn") or aa.get("in") or {}
+        out_asset = aa.get("asset_out") or aa.get("assetOut") or aa.get("out") or {}
 
-        token_amount = _amt(jt.get("amount"), dec)
-        if token_amount <= 0:
-            continue
-        candidates.append((recipient, token_amount))
+        def _asset_addr(x: Any) -> str:
+            if isinstance(x, dict):
+                addr = x.get("address") or x.get("master") or x.get("jetton_master") or x.get("jettonMaster") or ""
+                return str(addr)
+            return ""
 
-    if not candidates:
-        return []
+        def _is_ton_asset(x: Any) -> bool:
+            if not isinstance(x, dict):
+                return False
+            t = str(x.get("type") or x.get("kind") or x.get("asset_type") or "").lower()
+            if t == "ton":
+                return True
+            sym = str(x.get("symbol") or x.get("ticker") or x.get("name") or "").lower()
+            if sym in ("ton","wton","pton"):
+                return True
+            # TonAPI sometimes stores ton as a dict without address, but with decimals=9
+            if _asset_addr(x) in ("", None) and str(x).lower().find("ton") != -1:
+                return True
+            return False
 
-    # Correlate TON spent by the same wallet.
-    ton_spent_by: Dict[str, float] = {}
-    for a in actions:
-        if not isinstance(a, dict):
-            continue
-        t = str(a.get("type") or "")
-        if t not in ("TonTransfer", "TONTransfer", "Transfer"):
-            continue
-        tt = a.get("TonTransfer") or a.get("TONTransfer") or a.get("Transfer")
-        if not isinstance(tt, dict):
-            continue
-        sender_addr = _addr(tt.get("sender"))
-        recip_addr = _addr(tt.get("recipient"))
-        ton_amt = _amt(tt.get("amount"), 9)
-        if ton_amt <= 0 or not sender_addr or not recip_addr or sender_addr == recip_addr:
-            continue
-        ton_spent_by[sender_addr] = max(ton_spent_by.get(sender_addr, 0.0), ton_amt)
+        def _parse_amount(raw: Any, asset: Any) -> Optional[float]:
+            """Handle both already-decimal numbers and raw on-chain integers."""
+            if raw is None:
+                return None
+            # numeric
+            if isinstance(raw, (int, float)):
+                val = float(raw)
+            else:
+                s = str(raw).strip()
+                if not s:
+                    return None
+                # if it looks like an integer string, keep as int-like
+                if s.replace("-", "").isdigit():
+                    try:
+                        val = float(int(s))
+                    except Exception:
+                        val = _to_float(s)
+                else:
+                    val = _to_float(s)
 
-    # Fallback to attached TON for wallet-originated DEX calls.
-    for a in actions:
-        if not isinstance(a, dict) or a.get("type") != "SmartContractExec":
-            continue
-        sc = a.get("SmartContractExec")
-        if not isinstance(sc, dict):
-            continue
-        ex_addr = _addr(sc.get("executor"))
-        ton_attached = _amt(sc.get("ton_attached") or sc.get("tonAttached"), 9)
-        if ex_addr and ton_attached > 0:
-            ton_spent_by[ex_addr] = max(ton_spent_by.get(ex_addr, 0.0), ton_attached)
+            # scale if it looks like a raw integer
+            dec = None
+            if isinstance(asset, dict):
+                d = asset.get("decimals")
+                if isinstance(d, int):
+                    dec = d
+                else:
+                    try:
+                        dec = int(d)
+                    except Exception:
+                        dec = None
 
-    out: List[Dict[str, Any]] = []
-    seen_buyers = set()
-    for buyer_addr, token_amount in candidates:
-        if buyer_addr in seen_buyers:
+            if dec is not None:
+                # If we got a big integer-ish value and no decimal point in original, assume raw.
+                raw_s = str(raw).strip() if raw is not None else ""
+                if raw_s and raw_s.replace("-", "").isdigit() and abs(val) >= 10 ** (dec + 2):
+                    val = val / (10 ** dec)
+
+            return val
+
+        in_addr = _asset_addr(in_asset)
+        out_addr = _asset_addr(out_asset)
+
+        amt_in = _parse_amount(aa.get("amount_in") or aa.get("amountIn"), in_asset)
+        amt_out = _parse_amount(aa.get("amount_out") or aa.get("amountOut"), out_asset)
+
+        # BUY must be TON -> token
+        if not (_is_ton_asset(in_asset) and str(out_addr) == str(token_addr)):
             continue
-        seen_buyers.add(buyer_addr)
-        ton_amount = ton_spent_by.get(buyer_addr, 0.0)
-        if ton_amount <= 0:
+
+        ton_in = amt_in
+        jet_out = amt_out
+        if not ton_in or not jet_out:
             continue
+
+        buyer = (aa.get("user") or aa.get("sender") or aa.get("initiator") or aa.get("from") or "")
+        if isinstance(buyer, dict):
+            buyer = buyer.get("address") or ""
+        buyer = str(buyer)
+
         out.append({
             "tx": tx_hash,
-            "buyer": buyer_addr,
-            "ton": ton_amount,
-            "token_amount": token_amount,
+            "buyer": buyer,
+            "ton": ton_in,
+            "token_amount": jet_out,
         })
+
     return out
 
 def dedust_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
@@ -3375,8 +3209,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_admin(context.bot, chat.id, user.id):
             await q.answer(_settings_words(_get_group_lang(chat.id, user.id))["admins_only"], show_alert=True)
             return
-        _clear_user_input_states(user.id)
-        _clear_user_input_states(user.id)
         AWAITING[user.id] = {"group_id": chat.id, "stage": "GROUP_ADD", "dex": "both"}
         await context.bot.send_message(chat_id=chat.id, text=_settings_words(_get_group_lang(chat.id, user.id))["paste_ca"])
         return
@@ -3533,7 +3365,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not group_id:
             return
         dex = "ston" if data.startswith("DEX_STON_") else "dedust"
-        _clear_user_input_states(user.id)
         AWAITING[user.id] = {"group_id": group_id, "stage": "CA", "dex": dex}
         await q.edit_message_text(
             "Send the token CA now (EQ… / UQ…) or a supported link (GT/DexS/STON/DeDust).\n\n"
@@ -4186,28 +4017,12 @@ async def _infer_target_group_from_state(user_id: int) -> Optional[int]:
             return None
     return None
 
-def _clear_user_input_states(user_id: int):
-    AWAITING_EDIT_INPUT.pop(user_id, None)
-    AWAITING_SOCIAL.pop(user_id, None)
-    AWAITING_CUSTOM_EMOJI.pop(user_id, None)
-    AWAITING_IMAGE.pop(user_id, None)
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat or not update.effective_user:
         return
     chat = update.effective_chat
     user = update.effective_user
     text = (update.message.text or "").strip()
-
-    cfg_now = AWAITING.get(user.id)
-    awaiting_add = False
-    if isinstance(cfg_now, dict):
-        stage_now = str(cfg_now.get("stage") or "")
-        group_now = int(cfg_now.get("group_id") or 0)
-        if chat.type == "private":
-            awaiting_add = stage_now == "CA" and group_now > 0
-        elif chat.type in ("group", "supergroup"):
-            awaiting_add = stage_now == "GROUP_ADD" and group_now == chat.id
 
     # "ca" shortcut in groups: show currently configured token address (like listing bots)
     if chat.type in ("group", "supergroup") and text.lower() == "ca":
@@ -4250,7 +4065,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-    if user.id in AWAITING_EDIT_INPUT and not awaiting_add:
+    if user.id in AWAITING_EDIT_INPUT:
         cfg = AWAITING_EDIT_INPUT.get(user.id) or {}
         target_chat_id = int(cfg.get("chat_id") or 0)
         field = str(cfg.get("field") or "")
@@ -4317,14 +4132,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_customize_panel(target_chat_id, context, update.message)
                 return
             if field == "emoji":
-                raw = (text or "").strip()
-                if len(raw) > 180:
-                    await update.message.reply_text("Emoji text too long. Send a single emoji or a <tg-emoji ...> tag.")
-                    return
-                if "<tg-emoji" not in raw and len(raw) > 12:
-                    await update.message.reply_text("Send a single emoji (e.g. 🟢) or Telegram premium custom emoji in <tg-emoji ...> format.")
-                    return
-                s["strength_emoji"] = raw
+                s["strength_emoji"] = text[:12]
                 save_groups()
                 AWAITING_EDIT_INPUT.pop(user.id, None)
                 try:
@@ -4343,7 +4151,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # Social link input (Token Settings -> Social Links)
-    if user.id in AWAITING_SOCIAL and not awaiting_add:
+    if user.id in AWAITING_SOCIAL:
         cfg = AWAITING_SOCIAL.get(user.id) or {}
         target_chat_id = int(cfg.get("chat_id") or 0)
         field = str(cfg.get("field") or "telegram")
@@ -4371,9 +4179,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = await _to_thread(resolve_jetton_from_text_sync, text)
     if not addr:
         return
-
-    if awaiting_add:
-        _clear_user_input_states(user.id)
 
     # Optional: token telegram link can be sent together with CA.
     # Example: EQ... https://t.me/YourToken
@@ -4860,8 +4665,6 @@ async def poll_once(app: Application):
                     ev_ts = int(ev.get("timestamp") or ev.get("time") or ev.get("ts") or 0)
                     if ignore_before and ev_ts and ev_ts < ignore_before:
                         continue
-                    if _is_stale_post(ev_ts):
-                        continue
                     pair_id = str(ev.get("pairId") or "").strip()
                     if pair_id != pool:
                         continue
@@ -4897,13 +4700,12 @@ async def poll_once(app: Application):
                 if not posted_any:
                     try:
                         txs = await _to_thread(tonapi_account_transactions, pool, 15)
-                        txs = sorted([x for x in (txs or []) if isinstance(x, dict)], key=_tx_sort_key)
+                        # process oldest -> newest
+                        txs = list(reversed(txs))
                         for txo in txs:
                             ignore_before = int(token.get("ignore_before_ts") or 0)
                             ut = int(txo.get("utime") or 0)
                             if ignore_before and ut and ut < ignore_before:
-                                continue
-                            if _is_stale_post(ut):
                                 continue
                             buys = stonfi_extract_buys_from_tonapi_tx(txo, token["address"])
                             for b in buys:
@@ -5006,14 +4808,8 @@ async def poll_once(app: Application):
                 max_seen_ts = last_ts
 
                 for lt_i, ts_i, b, tr in items2:
-                    skip_trade, resolved_ts = should_skip_by_tx_meta(pool, b.get("tx"), ts_i, ignore_before)
-                    if resolved_ts:
-                        ts_i = int(resolved_ts)
-                    if lt_i and lt_i > max_seen_lt:
-                        max_seen_lt = lt_i
-                    if ts_i and ts_i > max_seen_ts:
-                        max_seen_ts = ts_i
-                    if skip_trade:
+                    # ignore old history right after token added
+                    if ignore_before and ts_i and ts_i < ignore_before:
                         continue
 
                     is_new = False
@@ -5099,16 +4895,7 @@ async def poll_once(app: Application):
                                         break
                                     if last_ets and ts and ts <= last_ets:
                                         continue
-                                    skip_ev, resolved_ts = should_skip_by_tx_meta(pool, tonapi_event_tx_hash(ev), ts, ignore_before)
-                                    if resolved_ts:
-                                        ts = int(resolved_ts)
-                                    if skip_ev:
-                                        eid_new = str(ev.get('event_id') or ev.get('id') or '').strip()
-                                        ts_new = int(ts or 0)
-                                        if eid_new:
-                                            token['last_dedust_event_id'] = eid_new
-                                        if ts_new:
-                                            token['last_dedust_event_ts'] = ts_new
+                                    if ignore_before and ts and ts < ignore_before:
                                         continue
                                     new_events.append(ev)
                 
@@ -5180,11 +4967,9 @@ async def poll_once(app: Application):
                 for watch_addr in watch_addrs:
                     evs = await _to_thread(tonapi_account_events, watch_addr, BLUM_EVENT_LIMIT)
                     if isinstance(evs, list) and evs:
-                        evs = sorted([x for x in evs if isinstance(x, dict)], key=_event_sort_key, reverse=True)
-                        inherit_global = (len(watch_addrs) == 1)
-                        last_eid = str(last_eid_map.get(watch_addr) or (token.get("last_blum_event_id") if inherit_global else "") or "").strip()
+                        last_eid = str(last_eid_map.get(watch_addr) or token.get("last_blum_event_id") or "").strip()
                         try:
-                            last_ets = int(last_ets_map.get(watch_addr) or ((token.get("last_blum_event_ts") if inherit_global else 0) or 0))
+                            last_ets = int(last_ets_map.get(watch_addr) or token.get("last_blum_event_ts") or 0)
                         except Exception:
                             last_ets = 0
 
@@ -5211,8 +4996,6 @@ async def poll_once(app: Application):
                             if last_ets and ts and ts <= last_ets:
                                 continue
                             if ignore_before and ts and ts < ignore_before:
-                                continue
-                            if _is_stale_post(ts):
                                 continue
                             new_events.append(ev)
 
@@ -5262,10 +5045,8 @@ async def poll_once(app: Application):
                     txs = await _to_thread(tonapi_account_transactions, watch_addr, BLUM_TX_LIMIT)
                     if not (isinstance(txs, list) and txs):
                         continue
-                    txs = sorted([x for x in txs if isinstance(x, dict)], key=_tx_sort_key, reverse=True)
-                    inherit_global = (len(watch_addrs) == 1)
-                    last_tx = str(last_tx_map.get(watch_addr) or (token.get("last_blum_tx") if inherit_global else "") or "").strip()
-                    last_lt = str(last_lt_map.get(watch_addr) or (token.get("last_blum_lt") if inherit_global else "") or "").strip()
+                    last_tx = str(last_tx_map.get(watch_addr) or token.get("last_blum_tx") or "").strip()
+                    last_lt = str(last_lt_map.get(watch_addr) or token.get("last_blum_lt") or "").strip()
 
                     if not last_tx and not last_lt:
                         last_tx_map[watch_addr] = str(_tx_hash(txs[0]) or "").strip()
@@ -5289,11 +5070,8 @@ async def poll_once(app: Application):
                             break
                         if last_lt and lt0 and lt0 == last_lt:
                             break
-                        skip_tx0, resolved_uts0 = should_skip_by_tx_meta(watch_addr, txh0, uts0, ignore_before)
-                        if skip_tx0:
+                        if ignore_before and uts0 and uts0 < ignore_before:
                             continue
-                        if resolved_uts0:
-                            uts0 = int(resolved_uts0)
                         new_txs.append(txo)
 
                     for txo in reversed(new_txs):
@@ -5765,17 +5543,17 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             holders_line = f"👥 Holders: {h(hval)}"
 
     # Links area
-    listing_line = f"❤️ <a href=\"{h(LISTING_URL)}\">TonListing</a>" if LISTING_URL else ""
+    listing_line = f'{premium_text_or_plain("listing", "🔥")} <a href="{h(LISTING_URL)}">Listing</a>' if LISTING_URL else ""
     chart_link = chart_url
-    chart_part = f"📈 <a href=\"{h(chart_link)}\">Chart</a>" if chart_link else "📈 Chart"
-    trending_part = f"🔥 <a href=\"{h(trending)}\">Trending</a>" if trending else "🔥 Trending"
+    chart_part = f'{premium_text_or_plain("chart", "🛡️")} <a href="{h(chart_link)}">Chart</a>' if chart_link else f'{premium_text_or_plain("chart", "🛡️")} Chart'
+    trending_part = f'<a href="{h(trending)}">Trending</a>' if trending else 'Trending'
     # DTrade deep link: use referral base + append token CA.
     # We URL-encode CA to avoid issues with special chars.
     from urllib.parse import quote as _urlquote
     ref = (DTRADE_REF or "https://t.me/dtrade?start=11TYq7LInG").rstrip("_")
     ca = (token.get("address") or "").strip()
     buy_url = f"{ref}_{_urlquote(ca, safe='')}" if ca else ref
-    dtrade_part = f"🛒 <a href=\"{h(buy_url)}\">DTrade</a>" if buy_url else "🛒 DTrade"
+    dtrade_part = f'{premium_text_or_plain("trade", "🐸")} <a href="{h(buy_url)}">Trade</a>' if buy_url else f'{premium_text_or_plain("trade", "🐸")} Trade'
     coc_part = f"💬 <a href=\"{h(tg_link)}\">COC</a>" if tg_link else ""
 
     links_line_parts = [chart_part, trending_part]
@@ -5789,14 +5567,39 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     ad_line = f"ad: <a href=\"{h(ad_link)}\">{h(ad_text)}</a>" if ad_link else f"ad: {h(ad_text)}"
 
     def build_group_message() -> str:
-        """Group buy card using the requested compact KYRON style."""
+        """Group buy card styled like the latest requested screenshot."""
         header_token = tok_symbol or title or "TOKEN"
+        header_inner = f'{premium_text_or_plain("title", "🛡️")} <b>${h(header_token)} BUY!</b>'
         if tg_link:
-            header_token_html = f'<a href="{h(tg_link)}"><b>{h(header_token)}</b></a>'
+            header = f'<a href="{h(tg_link)}">{header_inner}</a>'
         elif chart_link:
-            header_token_html = f'<a href="{h(chart_link)}"><b>{h(header_token)}</b></a>'
+            header = f'<a href="{h(chart_link)}">{header_inner}</a>'
         else:
-            header_token_html = f'<b>{h(header_token)}</b>'
+            header = header_inner
+
+        token_line = ""
+        if tok_amt and tok_symbol:
+            sym_html = h(tok_symbol)
+            if tg_link:
+                sym_html = f'<a href="{h(tg_link)}">{h(tok_symbol)}</a>'
+            try:
+                tok_amt_f = float(tok_amt)
+                token_line = f'{premium_text_or_plain("got", "↔️")} {h(fmt_token_amount(tok_amt_f))} {sym_html}'
+            except Exception:
+                token_line = f'{premium_text_or_plain("got", "↔️")} {h(tok_amt)} {sym_html}'
+
+        buyer_html_local = h(buyer_short)
+        if buyer_url:
+            buyer_html_local = f'<a href="{h(buyer_url)}">{buyer_html_local}</a>'
+
+        change_part = ""
+        if isinstance(change_pct, (int, float)):
+            try:
+                v = float(change_pct)
+                sign = "+" if v > 0 else ""
+                change_part = f': {sign}{v:.1f}%'
+            except Exception:
+                change_part = ""
 
         def _price_disp(v):
             try:
@@ -5806,270 +5609,76 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             except Exception:
                 return "—"
 
-        def _fmt_compact_int(n: Optional[int]) -> str:
-            if n is None:
-                return "—"
-            try:
-                x = float(n)
-            except Exception:
-                return "—"
-            if x >= 1_000_000:
-                return f"{x/1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
-            if x >= 1_000:
-                return f"{x/1_000:.2f}".rstrip("0").rstrip(".") + "K"
-            return f"{int(x):,}"
-
         liq_val = fmt_usd(_pos_or_none(liq_usd), 0) or "—"
         mc_val = fmt_usd(_pos_or_none(mc_usd), 0) or "—"
-        holders_text = _fmt_compact_int(int(holders) if holders is not None else None)
+        holders_text = f"{holders:,}" if isinstance(holders, int) else (str(holders) if holders is not None else "—")
 
-        buyer_html_local = h(buyer_short)
-        if buyer_url:
-            buyer_html_local = f'<a href="{h(buyer_url)}">{buyer_html_local}</a>'
-        change_part = ""
-        if isinstance(change_pct, (int, float)):
-            try:
-                v = float(change_pct)
-                sign = "+" if v > 0 else ""
-                change_part = f': {sign}{v:.1f}%'
-            except Exception:
-                pass
-        txn_part = f' | <a href="{h(tx_url)}">Txn</a>' if tx_url else ' | Txn'
+        gt_link_local = gt_url or (gecko_terminal_pool_url(pair_for_links) if pair_for_links else "")
+        tx_part_local = f'<a href="{h(tx_url)}">TX</a>' if tx_url else 'TX'
+        gt_part_local = f'<a href="{h(gt_link_local)}">GT</a>' if gt_link_local else 'GT'
+        dexs_part_local = f'{premium_text_or_plain("chart", "📈")} <a href="{h(dex_url)}">DexS</a>' if dex_url else f'{premium_text_or_plain("chart", "📈")} DexS'
+        telegram_part_local = f'{premium_text_or_plain("telegram", "📣")} <a href="{h(tg_link)}">Telegram</a>' if tg_link else f'{premium_text_or_plain("telegram", "📣")} Telegram'
+        trending_part_local = f'<a href="{h(trending)}">Trending</a>' if trending else 'Trending'
+        links_row_local = " | ".join([tx_part_local, gt_part_local, dexs_part_local, telegram_part_local, trending_part_local])
 
-        token_line = ""
-        if tok_amt and tok_symbol:
-            sym_html = h(tok_symbol)
-            if tg_link:
-                sym_html = f'<a href="{h(tg_link)}">{h(tok_symbol)}</a>'
-            try:
-                token_line = f'{premium_text_or_plain("got", "↔️")} {h(fmt_token_amount(float(tok_amt)))} {sym_html}'
-            except Exception:
-                token_line = f'{premium_text_or_plain("got", "↔️")} {h(tok_amt)} {sym_html}'
+        buyer_line_local = f'{buyer_html_local}{change_part}'
 
-        listing_part = f'{premium_text_or_plain("listing", "🔥")} <a href="{h(LISTING_URL)}">Listing</a>' if LISTING_URL else f'{premium_text_or_plain("listing", "🔥")} Listing'
-        trade_part = f'{premium_text_or_plain("buy", "🐸")} <a href="{h(buy_url)}">Trade</a>' if buy_url else f'{premium_text_or_plain("buy", "🐸")} Trade'
-        chart_part = f'{premium_text_or_plain("chart", "🛡️")} <a href="{h(chart_link)}">Chart</a>' if chart_link else f'{premium_text_or_plain("chart", "🛡️")} Chart'
-
-        blocks = [
-            f'{premium_text_or_plain("title", "🛡️")} {header_token_html} Buy! {premium_text_or_plain("dex", "✨")}',
-            "",
-            strength_html or ("✅" * 22),
+        blocks: List[str] = [header]
+        if strength_html:
+            blocks.extend(["", strength_html])
+        blocks.extend([
             "",
             f'{premium_text_or_plain("spent", "💲")} {ton_amt:,.2f} TON{h(usd_disp)}',
-        ]
+        ])
         if token_line:
             blocks.append(token_line)
         blocks.extend([
-            f'{premium_text_or_plain("holders", "🫂")} {h(holders_text)} Holders',
-            f'{premium_text_or_plain("wallet", "🫂")} {buyer_html_local}{change_part}{txn_part}',
-            f'{premium_text_or_plain("price", "🗝️")} Price: {h(_price_disp(price_usd))}',
-            f'{premium_text_or_plain("mcap", "📈")} MarketCap: {h(mc_val)}',
             "",
-            " | ".join([listing_part, trade_part, chart_part]),
+            f'{premium_text_or_plain("wallet", "🛡️")} {buyer_line_local}',
+            f'{premium_text_or_plain("price", "🗝️")} Price: {h(_price_disp(price_usd))}',
+            f'{premium_text_or_plain("liquidity", "💧")} Liquidity: {h(liq_val)}',
+            f'{premium_text_or_plain("mcap", "📈")} MarketCap: <b>{h(mc_val)}</b>',
+            f'{premium_text_or_plain("holders", "🫂")} {h(holders_text)} Holders',
+        ])
+        if bool(token.get("blum_mode")):
+            try:
+                _bpct = float(token.get("blum_progress_pct") or 0.0)
+            except Exception:
+                _bpct = 0.0
+            try:
+                _bton = float(token.get("blum_progress_ton") or 0.0)
+            except Exception:
+                _bton = 0.0
+            try:
+                _bcap = float(token.get("blum_cap_ton") or BLUM_BONDING_CAP_TON or 1500.0)
+            except Exception:
+                _bcap = 1500.0
+            _lp = launchpad_label(token, str(source or ""))
+            _filled = max(0, min(10, int(_bpct // 10 if _bpct < 100 else 10)))
+            _bar = ("🟦" * _filled) + ("⬜" * (10 - _filled))
+            blocks.append(f'Bonding Buy — <b>{h(_lp)}</b>')
+            blocks.append(f'Target: <b>{h(f"{_bpct:.1f}%")}</b> ({h(f"{_bton:,.2f}")}/{h(f"{_bcap:,.0f}")} TON)')
+            blocks.append(_bar)
+        blocks.extend([
+            "",
+            links_row_local,
+            "",
             ad_line,
         ])
         return "\n".join([b for b in blocks if b is not None])
 
-    def _extract_custom_emoji_id(raw: str) -> str:
-        try:
-            m = re.search(r'emoji-id\s*=\s*"?(\d+)"?', str(raw or ""))
-            return m.group(1) if m else ""
-        except Exception:
-            return ""
-
-    def _plain_emoji_text(raw: str, fallback: str = "") -> str:
-        txt = re.sub(r"<[^>]+>", "", str(raw or "")).strip()
-        return txt or fallback
-
-    def build_trending_channel_payload() -> Tuple[str, List[MessageEntity]]:
-        """Trending channel message built with entities so premium emojis render reliably in channels."""
-        parts: List[str] = []
-        entities: List[MessageEntity] = []
-
-        def add(text: str, entity_specs: Optional[List[Dict[str, Any]]] = None):
-            base = sum(len(x) for x in parts)
-            parts.append(text)
-            for spec in (entity_specs or []):
-                spec2 = dict(spec)
-                spec2["offset"] = base + int(spec2.get("offset", 0))
-                entities.append(MessageEntity(**spec2))
-
-        def add_icon(name: str, fallback: str):
-            raw = premium_icon(name, fallback)
-            cid = _extract_custom_emoji_id(raw)
-            if cid:
-                add("▫", [{"type": "custom_emoji", "offset": 0, "length": 1, "custom_emoji_id": str(cid)}])
-            else:
-                add(_plain_emoji_text(raw, fallback))
-
-        def add_text_link(label: str, url: str):
-            if url:
-                add(label, [{"type": "text_link", "offset": 0, "length": len(label), "url": str(url)}])
-            else:
-                add(label)
-
-        def add_bold(label: str):
-            add(label, [{"type": "bold", "offset": 0, "length": len(label)}])
-
-        def add_strength_line():
-            if not bool(s.get("strength_on", True)):
-                return
-            try:
-                step = float(s.get("strength_step_ton") or 5.0)
-                max_n = int(s.get("strength_max") or 30)
-                emo = str(s.get("strength_emoji") or "🟢")
-                n = 1 if ton_amt > 0 else 0
-                if step > 0:
-                    effective_step = max(step, float(ton_amt) / 9.0) if ton_amt > 0 else step
-                    n = max(1, int(float(ton_amt) // effective_step))
-                n = min(max_n, max(1, n))
-            except Exception:
-                n = 0
-                emo = "🟢"
-            if n <= 0:
-                return
-            cid = _extract_custom_emoji_id(emo)
-            plain_emo = _plain_emoji_text(emo, "🟢")
-            per_line = 12
-            remaining = n
-            while remaining > 0:
-                take = min(per_line, remaining)
-                if cid:
-                    for _ in range(take):
-                        add("▫", [{"type": "custom_emoji", "offset": 0, "length": 1, "custom_emoji_id": str(cid)}])
-                else:
-                    add(plain_emo * take)
-                remaining -= take
-                if remaining > 0:
-                    add("\n")
-
-        header_token = (tok_symbol or title or "TOKEN")
-        add_icon("title", "🚀")
-        add(" | ")
-        link_for_symbol = tg_link or chart_link or ""
-        if link_for_symbol:
-            add_text_link(header_token, link_for_symbol)
-            entities.append(MessageEntity(type="bold", offset=sum(len(x) for x in parts) - len(header_token), length=len(header_token)))
-        else:
-            add_bold(header_token)
-        add(" Buy! ")
-        add_icon("dex", "✨")
-        add("\n\n")
-
-        add_strength_line()
-        add("\n\n")
-
-        add(" ")
-        add_icon("spent", "💎")
-        add(f"  {ton_amt:,.2f} TON{usd_disp}")
-        add("\n")
-
-        if tok_amt and tok_symbol:
-            add_icon("got", "🪙")
-            add(" ")
-            try:
-                tok_amt_txt = fmt_token_amount(float(tok_amt))
-            except Exception:
-                tok_amt_txt = str(tok_amt)
-            token_label = f"{tok_amt_txt} {tok_symbol}"
-            if tg_link:
-                add_text_link(token_label, tg_link)
-                entities.append(MessageEntity(type="bold", offset=sum(len(x) for x in parts) - len(token_label), length=len(token_label)))
-            else:
-                add_bold(token_label)
-            add("\n")
-
-        def _fmt_compact_int(n: Optional[int]) -> str:
-            if n is None:
-                return "—"
-            try:
-                x = float(n)
-            except Exception:
-                return "—"
-            if x >= 1_000_000:
-                return f"{x/1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
-            if x >= 1_000:
-                return f"{x/1_000:.2f}".rstrip("0").rstrip(".") + "K"
-            return f"{int(x):,}"
-
-        holders_compact = _fmt_compact_int(int(holders) if holders is not None else None)
-        add_icon("holders", "👥")
-        add(f" {holders_compact} Holders\n")
-
-        add_icon("wallet", "👛")
-        add(" ")
-        buyer_label = buyer_short or "—"
-        if buyer_url:
-            add_text_link(buyer_label, buyer_url)
-        else:
-            add(buyer_label)
-        if isinstance(change_pct, (int, float)):
-            try:
-                v = float(change_pct)
-                sign = "+" if v > 0 else ""
-                add(f": {sign}{v:.1f}%")
-            except Exception:
-                pass
-        add(" | ")
-        if tx_url:
-            add_text_link("Txn", tx_url)
-        else:
-            add("Txn")
-        add("\n")
-
-        add_icon("price", "💵")
-        try:
-            price_txt = f"${float(price_usd):,.6f}" if price_usd is not None else "—"
-        except Exception:
-            price_txt = "—"
-        add(f" Price: {price_txt}\n")
-
-        add_icon("mcap", "📊")
-        add(f" MarketCap: {fmt_usd(mc_usd, 0) or '—'}\n\n")
-
-        add_icon("spent", "💎")
-        add(" ")
-        add_text_link("Listing", LISTING_URL) if LISTING_URL else add("Listing")
-        add(" | ")
-        add_icon("buy", "🛒")
-        add(" ")
-        add_text_link("Buy", buy_url) if buy_url else add("Buy")
-        add(" | ")
-        add_icon("chart", "📈")
-        add(" ")
-        add_text_link("Chart", chart_link) if chart_link else add("Chart")
-        add("\n")
-
-        add("ad: ")
-        if ad_link:
-            add_text_link(str(ad_text), ad_link)
-        else:
-            add(str(ad_text))
-
-        return "".join(parts), entities
-
     def build_trending_channel_message() -> str:
-        """Trending channel style aligned with the requested KYRON layout."""
-        header_token = tok_symbol or title or "TOKEN"
+        """KYRON premium style matching the requested layout."""
+        header_token = (tok_symbol or title or "TOKEN").strip()
+        header_label = f"${header_token} BUY!"
         if tg_link:
-            header = f'{premium_text_or_plain("title", "🛡️")} | <a href="{h(tg_link)}"><b>{h(header_token)}</b></a> Buy! {premium_text_or_plain("dex", "✨")}'
+            header = f'{premium_text_or_plain("title", "🛡️")} <a href="{h(tg_link)}"><b>{h(header_label)}</b></a>'
         elif chart_link:
-            header = f'{premium_text_or_plain("title", "🛡️")} | <a href="{h(chart_link)}"><b>{h(header_token)}</b></a> Buy! {premium_text_or_plain("dex", "✨")}'
+            header = f'{premium_text_or_plain("title", "🛡️")} <a href="{h(chart_link)}"><b>{h(header_label)}</b></a>'
         else:
-            header = f'{premium_text_or_plain("title", "🛡️")} | <b>{h(header_token)}</b> Buy! {premium_text_or_plain("dex", "✨")}'
+            header = f'{premium_text_or_plain("title", "🛡️")} <b>{h(header_label)}</b>'
 
-        def _fmt_compact_int(n: Optional[int]) -> str:
-            if n is None:
-                return "—"
-            try:
-                x = float(n)
-            except Exception:
-                return "—"
-            if x >= 1_000_000:
-                return f"{x/1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
-            if x >= 1_000:
-                return f"{x/1_000:.2f}".rstrip("0").rstrip(".") + "K"
-            return f"{int(x):,}"
+        checks = strength_html or ("✅" * 22)
 
         token_line = ""
         if tok_amt and tok_symbol:
@@ -6077,11 +5686,27 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             if tg_link:
                 sym_html = f'<a href="{h(tg_link)}">{h(tok_symbol)}</a>'
             try:
-                token_line = f'{premium_text_or_plain("got", "↔️")} <b>{h(fmt_token_amount(float(tok_amt)))} {sym_html}</b>'
+                tok_amt_f = float(tok_amt)
+                token_line = f'{premium_text_or_plain("got", "↔️")} {h(fmt_token_amount(tok_amt_f))} {sym_html}'
             except Exception:
-                token_line = f'{premium_text_or_plain("got", "↔️")} <b>{h(tok_amt)} {sym_html}</b>'
+                token_line = f'{premium_text_or_plain("got", "↔️")} {h(tok_amt)} {sym_html}'
+
+        def _fmt_compact_int(n: Optional[int]) -> str:
+            if n is None:
+                return "—"
+            try:
+                x = float(n)
+            except Exception:
+                return "—"
+            if x >= 1_000_000:
+                return f"{x/1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+            if x >= 1_000:
+                return f"{x/1_000:.2f}".rstrip("0").rstrip(".") + "K"
+            return f"{int(x):,}"
 
         holders_compact = _fmt_compact_int(int(holders) if holders is not None else None)
+        holders_line_ch = f"{premium_text_or_plain('holders', '🫂')} {h(holders_compact)} Holders"
+
         buyer_html2 = h(buyer_short)
         if buyer_url:
             buyer_html2 = f'<a href="{h(buyer_url)}">{buyer_html2}</a>'
@@ -6090,37 +5715,41 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             try:
                 v = float(change_pct)
                 sign = "+" if v > 0 else ""
-                pct_part = f': {sign}{v:.1f}%'
+                pct_part = f": {sign}{v:.1f}%"
             except Exception:
-                pass
-        txn_part = f' | <a href="{h(tx_url)}">Txn</a>' if tx_url else ' | Txn'
-        try:
-            price_txt = f"${float(price_usd):,.6f}" if price_usd is not None else "—"
-        except Exception:
-            price_txt = "—"
+                pct_part = ""
+        txn_part = f' | <a href="{h(tx_url)}">Txn</a>' if tx_url else " | Txn"
+        buyer_line_ch = f"{premium_text_or_plain('wallet', '🛡️')} {buyer_html2}{pct_part}{txn_part}"
+
+        price_line = f"{premium_text_or_plain('price', '🗝️')} Price: —"
+        if price_usd is not None:
+            try:
+                price_line = f"{premium_text_or_plain('price', '🗝️')} Price: ${float(price_usd):,.6f}"
+            except Exception:
+                price_line = f"{premium_text_or_plain('price', '🗝️')} Price: —"
+        mc_line_ch = f"{premium_text_or_plain('mcap', '📈')} MarketCap: {h(fmt_usd(mc_usd, 0) or '—')}"
+
         listing_part = f'{premium_text_or_plain("listing", "🔥")} <a href="{h(LISTING_URL)}">Listing</a>' if LISTING_URL else f'{premium_text_or_plain("listing", "🔥")} Listing'
-        trade_part = f'{premium_text_or_plain("buy", "🐸")} <a href="{h(buy_url)}">Trade</a>' if buy_url else f'{premium_text_or_plain("buy", "🐸")} Trade'
+        trade_part = f'{premium_text_or_plain("trade", "🐸")} <a href="{h(buy_url)}">Trade</a>' if buy_url else f'{premium_text_or_plain("trade", "🐸")} Trade'
         chart_part = f'{premium_text_or_plain("chart", "🛡️")} <a href="{h(chart_link)}">Chart</a>' if chart_link else f'{premium_text_or_plain("chart", "🛡️")} Chart'
-        blocks = [
-            header,
-            "",
-            strength_html or ("✅" * 22),
-            "",
-            f'{premium_text_or_plain("spent", "💲")} {ton_amt:,.2f} TON{h(usd_disp)}',
-        ]
+        links_row = " | ".join([p for p in [listing_part, trade_part, chart_part] if p])
+
+        blocks: List[str] = []
+        blocks.append(header)
+        blocks.append("")
+        blocks.append(checks)
+        blocks.append("")
+        blocks.append(f"{premium_text_or_plain('spent', '💲')} {ton_amt:,.2f} TON{h(usd_disp)}")
         if token_line:
             blocks.append(token_line)
-        blocks.extend([
-            f'{premium_text_or_plain("holders", "🫂")} {h(holders_compact)} Holders',
-            f'{premium_text_or_plain("wallet", "🫂")} {buyer_html2}{pct_part}{txn_part}',
-            f'{premium_text_or_plain("price", "🗝️")} Price: {price_txt}',
-            f'{premium_text_or_plain("mcap", "📈")} MarketCap: {h(fmt_usd(mc_usd, 0) or "—")}',
-            "",
-            " | ".join([listing_part, trade_part, chart_part]),
-            ad_line,
-        ])
+        blocks.append(holders_line_ch)
+        blocks.append(buyer_line_ch)
+        blocks.append(price_line)
+        blocks.append(mc_line_ch)
+        blocks.append("")
+        blocks.append(links_row)
+        blocks.append(ad_line)
         return "\n".join([b for b in blocks if b is not None])
-
     def is_trending_dest(dest_chat_id: int) -> bool:
         return bool(TRENDING_POST_CHAT_ID and str(dest_chat_id) == str(TRENDING_POST_CHAT_ID))
 
@@ -6137,14 +5766,14 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     # - Trending channel: keep previous channel button style
     def build_buy_keyboard(dest_chat_id: int) -> InlineKeyboardMarkup:
         rows = []
-        trending_btn_url = (BOOK_TRENDING_URL or LISTING_URL or "").strip()
-        if trending_btn_url and buy_url:
-            rows.append([InlineKeyboardButton("Trending", url=trending_btn_url), InlineKeyboardButton("DTrade", url=buy_url)])
-        elif trending_btn_url:
-            rows.append([InlineKeyboardButton("Trending", url=trending_btn_url)])
+        if trending:
+            if buy_url:
+                rows.append([InlineKeyboardButton("Trending", url=trending), InlineKeyboardButton("DTrade", url=buy_url)])
+            else:
+                rows.append([InlineKeyboardButton("Trending", url=trending)])
         elif buy_url:
             rows.append([InlineKeyboardButton("DTrade", url=buy_url)])
-        return InlineKeyboardMarkup(rows) if rows else None
+        return InlineKeyboardMarkup(rows)
 
     async def _send(dest_chat_id: int):
         if is_trending_dest(int(dest_chat_id)) and float(ton_amt or 0.0) < float(TRENDING_MIN_BUY_TON or 0.0):
@@ -6152,6 +5781,20 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         kb = build_buy_keyboard(int(dest_chat_id))
         local_msg = build_trending_channel_message() if is_trending_dest(int(dest_chat_id)) else build_group_message()
 
+        # --- Premium emoji bar for trending channel (entities-based, reliable) ---
+        if int(dest_chat_id) == int(TRENDING_CHANNEL_ID_FORCED):
+            try:
+                # reuse same strength count as message builder uses
+                strength_count = int(emoji_strength_count(buy_ton, settings))
+                bar_text, bar_entities = build_premium_bar_entities(strength_count, FORCED_CHANNEL_CUSTOM_EMOJI_ID)
+                if bar_text:
+                    await app.bot.send_message(
+                        chat_id=dest_chat_id,
+                        text=bar_text,
+                        entities=bar_entities,
+                    )
+            except Exception:
+                pass
         # Never send group buy media into the trending channel.
         if use_image and (not is_trending_dest(int(dest_chat_id))):
             if buy_media_type == "animation":
@@ -6216,8 +5859,8 @@ async def tracker_loop(app: Application):
 
 
 
-TRENDING_CHANNEL_ID_FORCED = int(os.getenv("TRENDING_CHANNEL_ID_FORCED", str(TRENDING_POST_CHAT_ID or 0)) or 0)
-FORCED_CHANNEL_CUSTOM_EMOJI_ID = str(os.getenv("FORCED_CHANNEL_CUSTOM_EMOJI_ID", "5188481279963715781"))
+TRENDING_CHANNEL_ID_FORCED = -1002379265999
+FORCED_CHANNEL_CUSTOM_EMOJI_ID = "5188481279963715781"
 
 def build_premium_bar_entities(count: int, emoji_id: str):
     """
@@ -6545,23 +6188,6 @@ def run_flask():
 
 # -------------------- MAIN --------------------
 async def post_init(app: Application):
-    # Baseline all existing configured tokens on startup so a restart does not replay old buys.
-    try:
-        for chat_id_s, g in list(GROUPS.items()):
-            try:
-                token = (g or {}).get("token") or {}
-                if not isinstance(token, dict) or not token.get("address"):
-                    continue
-                chat_id_i = int(chat_id_s)
-                token["ignore_before_ts"] = int(time.time())
-                await warmup_seen_for_chat(chat_id_i, token.get("ston_pool"), token.get("dedust_pool"))
-            except Exception as _e:
-                log.debug("startup warmup err chat=%s %s", chat_id_s, _e)
-        save_groups()
-        log.info("Startup warmup finished.")
-    except Exception as _e:
-        log.debug("startup warmup failed %s", _e)
-
     # start tracker
     app.create_task(tracker_loop(app))
     log.info("Tracker started.")
