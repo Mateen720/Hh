@@ -24,8 +24,8 @@ log = logging.getLogger("spyton_public")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
-POLL_INTERVAL = max(0.20, float(os.getenv("POLL_INTERVAL", "0.35")))
-TONAPI_TIMEOUT = max(3.0, float(os.getenv("TONAPI_TIMEOUT", "8")))
+POLL_INTERVAL = max(0.08, float(os.getenv("POLL_INTERVAL", "0.12")))
+TONAPI_TIMEOUT = max(2.0, float(os.getenv("TONAPI_TIMEOUT", "4")))
 STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "0")).strip().lower() in ("1","true","yes","on")
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600"))))
@@ -1436,7 +1436,7 @@ I18N: Dict[str, Dict[str, str]] = {
     "lang_set_ok_ru": "Language saved: Russian ✅",
     "need_admin": "Admins only.",
     "wiz_paste_title": "🛰 KYRON Setup — Paste Token CA",
-    "wiz_paste_hint": "STON.fi / DeDust / Groypad will be auto-detected.",
+    "wiz_paste_hint": "STON.fi / DeDust will be auto-detected.",
     "wiz_found_title": "🔎 Token found",
     "wiz_confirm": "✅ Confirm",
     "wiz_edit": "✏️ Edit",
@@ -1471,7 +1471,7 @@ I18N: Dict[str, Dict[str, str]] = {
     "lang_set_ok_ru": "Язык сохранён: Русский ✅",
     "need_admin": "Только для админов.",
     "wiz_paste_title": "🛰 Настройка KYRON — отправьте CA",
-    "wiz_paste_hint": "STON.fi / DeDust / Groypad будут определены автоматически.",
+    "wiz_paste_hint": "STON.fi / DeDust будут определены автоматически.",
     "wiz_found_title": "🔎 Токен найден",
     "wiz_confirm": "✅ Подтвердить",
     "wiz_edit": "✏️ Изменить",
@@ -2847,7 +2847,7 @@ def _lang_for_chat(chat_id: int) -> str:
 def _settings_words(lang: str) -> dict:
     if _ru(lang):
         return {
-            'customize_title': '*Настройка токена*',
+            'customize_title': 'Настройка токена',
             'no_token': '*Токен ещё не добавлен.*\n\nНажмите *Добавить токен* для начала.',
             'name': 'Название', 'tab':'✅ Раздел', 'buy_step':'ℹ️ Шаг покупки', 'min_buy':'ℹ️ Мин. покупка',
             'link':'ℹ️ Ссылка', 'emoji':'ℹ️ Эмодзи', 'media':'ℹ️ Медиа', 'edit':'✏️', 'set':'установлено',
@@ -2882,7 +2882,7 @@ def _settings_words(lang: str) -> dict:
             'none':'—'
         }
     return {
-        'customize_title': '*Customize your Token*',
+        'customize_title': 'Customize your Token',
         'no_token': '*No token configured yet.*\n\nTap *Add token* to begin.',
         'name':'Name', 'tab':'✅ Tab', 'buy_step':'ℹ️ Buy Step', 'min_buy':'ℹ️ Min Buy', 'link':'ℹ️ Link', 'emoji':'ℹ️ Emoji', 'media':'ℹ️ Media', 'edit':'✏️', 'set':'set',
         'return':'« Return', 'token_settings':'*Token Settings*', 'token':'Token', 'status':'Status', 'running':'RUNNING ✅', 'paused':'PAUSED ⏸️', 'choose_module':'Choose a module:',
@@ -2915,9 +2915,9 @@ def _customize_text(chat_id: int) -> str:
     addr = str(tok.get("address") or "")
     name = str(tok.get("name") or tok.get("symbol") or "Token")
     return (
-        f"{words['customize_title']}\n\n"
-        f"`{addr}`\n\n"
-        f"*{words['name']}:* {html.escape(name)}"
+        f"<b>{html.escape(words['customize_title'])}</b>\n\n"
+        f"<code>{html.escape(addr)}</code>\n\n"
+        f"<b>{html.escape(words['name'])}:</b> {html.escape(name)}"
     )
 
 def _customize_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -4187,7 +4187,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym = str(tok.get("symbol") or "").strip()
         ca = str(tok.get("address") or "").strip()
         header = f"{name} — (${sym})" if sym else f"{name}"
-        await update.message.reply_text(f"{header}\n\n{ca}")
+        await update.message.reply_text(f"<b>{html.escape(header)}</b>\n\n<code>{html.escape(ca)}</code>", parse_mode="HTML")
         return
 
     # Awaiting custom buy-strength emoji (can be normal emoji or Telegram premium <tg-emoji ...>)
@@ -4801,7 +4801,7 @@ async def poll_once(app: Application):
                 # Fast path first: TonAPI /events on the pool is usually earlier than the export feed.
                 posted_any = False
                 try:
-                    events = await _to_thread(tonapi_account_events_subject, pool, 12)
+                    events = await _to_thread(tonapi_account_events_subject, pool, 6)
                     if isinstance(events, list) and events:
                         last_eid = str(token.get('last_ston_event_id') or '').strip()
                         try:
@@ -5446,7 +5446,13 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         price_usd = _to_float(_mcached.get("price_usd")) if _mcached.get("price_usd") is not None else price_usd
         liq_usd = _to_float(_mcached.get("liq_usd")) if _mcached.get("liq_usd") is not None else liq_usd
         mc_usd = _to_float(_mcached.get("mc_usd")) if _mcached.get("mc_usd") is not None else mc_usd
-    if pool_for_market:
+    refresh_remote_market = True
+    try:
+        refresh_remote_market = (_now - int(token.get("_fast_market_ts") or 0)) >= 25
+    except Exception:
+        refresh_remote_market = True
+
+    if pool_for_market and refresh_remote_market:
         pinfo = gecko_pool_info(pool_for_market)
         if pinfo:
             pv = _to_float(pinfo.get("price_usd"))
@@ -5477,7 +5483,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 if mc_usd is None:
                     mc_usd = _to_float(dpair.get("marketCap") or dpair.get("market_cap") or dpair.get("fdv") or dpair.get("fdv_usd"))
 
-    if (price_usd is None or mc_usd is None) and token.get("address"):
+    if (price_usd is None or mc_usd is None) and token.get("address") and refresh_remote_market:
         tinfo = gecko_token_info(token["address"])
         if tinfo:
             if price_usd is None:
@@ -5489,6 +5495,9 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                 if mv is not None:
                     mc_usd = mv
 
+    if refresh_remote_market:
+        token["_fast_market_ts"] = _now
+
     # Holders (keep last known value if APIs fail)
     holders = None
     try:
@@ -5497,7 +5506,13 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     except Exception:
         holders = None
 
-    if jetton_addr:
+    refresh_holders = True
+    try:
+        refresh_holders = (_now - int(token.get("_holders_refresh_ts") or 0)) >= 45
+    except Exception:
+        refresh_holders = True
+
+    if jetton_addr and refresh_holders:
         # TonAPI Jetton info sometimes includes holders_count. If not, fall back
         # to the dedicated holders endpoint.
         try:
@@ -5514,6 +5529,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     holders = int(h2)
             except Exception:
                 pass
+        token["_holders_refresh_ts"] = _now
 
     # Persist latest known holders so the field doesn't disappear in later buys.
     if holders is not None:
@@ -5530,7 +5546,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             total_supply = float(token.get("total_supply"))
     except Exception:
         total_supply = None
-    if total_supply is None and jetton_addr:
+    if total_supply is None and jetton_addr and refresh_remote_market:
         try:
             info = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton_addr}") or {}
             meta = info.get("metadata") or {}
