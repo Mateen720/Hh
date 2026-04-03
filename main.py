@@ -1650,6 +1650,45 @@ def active_ad() -> Tuple[str, str, int]:
 
 # -------------------- CACHES --------------------
 TX_LT_CACHE: Dict[str, Tuple[int, str]] = {}  # key=f"{account}:{lt}" -> (ts, hash)
+
+def _safe_ts(v: Any) -> int:
+    try:
+        ts = int(float(v or 0))
+    except Exception:
+        ts = 0
+    if ts > 10_000_000_000:
+        ts //= 1000
+    return max(ts, 0)
+
+def _tx_lt_int(tx: Dict[str, Any]) -> int:
+    if not isinstance(tx, dict):
+        return 0
+    tid = tx.get("transaction_id") or {}
+    for cand in (tx.get("lt"), tid.get("lt")):
+        try:
+            return int(str(cand).strip())
+        except Exception:
+            pass
+    return 0
+
+def _tx_sort_key(tx: Dict[str, Any]) -> tuple[int, int]:
+    if not isinstance(tx, dict):
+        return (0, 0)
+    ts = _safe_ts(tx.get("utime") or tx.get("now") or tx.get("timestamp") or tx.get("tx_time") or tx.get("time"))
+    return (ts, _tx_lt_int(tx))
+
+def _event_sort_key(ev: Dict[str, Any]) -> tuple[int, int]:
+    if not isinstance(ev, dict):
+        return (0, 0)
+    ts = _safe_ts(ev.get("timestamp") or ev.get("utime") or ev.get("time") or ev.get("ts"))
+    rank = 0
+    for cand in (ev.get("lt"), ev.get("event_id"), ev.get("id")):
+        try:
+            rank = int(str(cand).strip())
+            break
+        except Exception:
+            continue
+    return (ts, rank)
 MARKET_CACHE: Dict[str, Dict[str, Any]] = {}  # key=pool or token -> {ts, price_usd, liq_usd, mc_usd, holders}
 
 # Jetton metadata cache (decimals/symbol/name) to fix wrong amounts from some DEX APIs
@@ -1808,11 +1847,12 @@ async def stonfi_latest_swaps(pool: str, limit: int = 25) -> List[Dict[str, Any]
     This is used only to avoid posting old buys right after configuration."""
     try:
         txs = await _to_thread(tonapi_account_transactions, pool, int(limit))
+        txs = sorted([x for x in (txs or []) if isinstance(x, dict)], key=_tx_sort_key, reverse=True)
         out = []
-        for txo in txs or []:
+        for txo in txs:
             h = _tx_hash(txo)
             if h:
-                out.append({"hash": h})
+                out.append({"hash": h, "utime": _safe_ts(txo.get("utime") or txo.get("now") or txo.get("timestamp")), "lt": str(txo.get("lt") or ((txo.get("transaction_id") or {}).get("lt") or ""))})
         return out
     except Exception:
         return []
@@ -1836,6 +1876,10 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
         newest_blum_tx = None
         newest_blum_lt = None
         blum_progress_ton = None
+        blum_event_map: Dict[str, str] = {}
+        blum_event_ts_map: Dict[str, int] = {}
+        blum_tx_map: Dict[str, str] = {}
+        blum_lt_map: Dict[str, str] = {}
 
         # STON.fi (warmup by pool tx hashes from TonAPI)
         if ston_pool:
@@ -1909,12 +1953,16 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                 for watch_addr0 in launchpad_watch_addresses(tok0):
                     evs = await _to_thread(tonapi_account_events, watch_addr0, BLUM_EVENT_LIMIT)
                     if isinstance(evs, list) and evs:
+                        evs = sorted([x for x in evs if isinstance(x, dict)], key=_event_sort_key, reverse=True)
                         newest = evs[0]
-                        newest_blum_eid = str(newest.get("event_id") or newest.get("id") or "").strip() or newest_blum_eid
-                        try:
-                            newest_blum_ts = int(newest.get("timestamp") or 0) or newest_blum_ts
-                        except Exception:
-                            pass
+                        newest_eid0 = str(newest.get("event_id") or newest.get("id") or "").strip()
+                        newest_ts0 = _safe_ts(newest.get("timestamp") or newest.get("utime") or newest.get("time") or newest.get("ts"))
+                        if newest_eid0:
+                            blum_event_map[watch_addr0] = newest_eid0
+                            newest_blum_eid = newest_eid0 or newest_blum_eid
+                        if newest_ts0:
+                            blum_event_ts_map[watch_addr0] = newest_ts0
+                            newest_blum_ts = newest_ts0 or newest_blum_ts
                         for ev in reversed(evs):
                             buys = blum_extract_buys_from_tonapi_event(ev, tok0.get("address"))
                             for b in buys:
@@ -1924,9 +1972,16 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                                     pass
                     txs = await _to_thread(tonapi_account_transactions, watch_addr0, BLUM_TX_LIMIT)
                     if isinstance(txs, list) and txs:
+                        txs = sorted([x for x in txs if isinstance(x, dict)], key=_tx_sort_key, reverse=True)
                         newest_tx0 = txs[0]
-                        newest_blum_tx = str(_tx_hash(newest_tx0) or "").strip() or newest_blum_tx
-                        newest_blum_lt = str(newest_tx0.get("lt") or "").strip() or newest_blum_lt
+                        newest_txh0 = str(_tx_hash(newest_tx0) or "").strip()
+                        newest_lt0 = str(newest_tx0.get("lt") or ((newest_tx0.get("transaction_id") or {}).get("lt") or "")).strip()
+                        if newest_txh0:
+                            blum_tx_map[watch_addr0] = newest_txh0
+                            newest_blum_tx = newest_txh0 or newest_blum_tx
+                        if newest_lt0:
+                            blum_lt_map[watch_addr0] = newest_lt0
+                            newest_blum_lt = newest_lt0 or newest_blum_lt
                         if total_ton <= 0:
                             for txo in reversed(txs):
                                 buys = blum_extract_buys_from_tonapi_tx(txo, tok0.get("address"))
@@ -1958,6 +2013,14 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                 tok["last_blum_tx"] = newest_blum_tx
             if newest_blum_lt:
                 tok["last_blum_lt"] = newest_blum_lt
+            if blum_event_map:
+                tok["last_blum_event_by_watch"] = blum_event_map
+            if blum_event_ts_map:
+                tok["last_blum_event_ts_by_watch"] = blum_event_ts_map
+            if blum_tx_map:
+                tok["last_blum_tx_by_watch"] = blum_tx_map
+            if blum_lt_map:
+                tok["last_blum_lt_by_watch"] = blum_lt_map
             if blum_progress_ton is not None:
                 tok["blum_progress_ton"] = round(float(blum_progress_ton), 6)
                 try:
@@ -4812,8 +4875,7 @@ async def poll_once(app: Application):
                 if not posted_any:
                     try:
                         txs = await _to_thread(tonapi_account_transactions, pool, 15)
-                        # process oldest -> newest
-                        txs = list(reversed(txs))
+                        txs = sorted([x for x in (txs or []) if isinstance(x, dict)], key=_tx_sort_key)
                         for txo in txs:
                             ignore_before = int(token.get("ignore_before_ts") or 0)
                             ut = int(txo.get("utime") or 0)
@@ -5096,9 +5158,11 @@ async def poll_once(app: Application):
                 for watch_addr in watch_addrs:
                     evs = await _to_thread(tonapi_account_events, watch_addr, BLUM_EVENT_LIMIT)
                     if isinstance(evs, list) and evs:
-                        last_eid = str(last_eid_map.get(watch_addr) or token.get("last_blum_event_id") or "").strip()
+                        evs = sorted([x for x in evs if isinstance(x, dict)], key=_event_sort_key, reverse=True)
+                        inherit_global = (len(watch_addrs) == 1)
+                        last_eid = str(last_eid_map.get(watch_addr) or (token.get("last_blum_event_id") if inherit_global else "") or "").strip()
                         try:
-                            last_ets = int(last_ets_map.get(watch_addr) or token.get("last_blum_event_ts") or 0)
+                            last_ets = int(last_ets_map.get(watch_addr) or ((token.get("last_blum_event_ts") if inherit_global else 0) or 0))
                         except Exception:
                             last_ets = 0
 
@@ -5176,8 +5240,10 @@ async def poll_once(app: Application):
                     txs = await _to_thread(tonapi_account_transactions, watch_addr, BLUM_TX_LIMIT)
                     if not (isinstance(txs, list) and txs):
                         continue
-                    last_tx = str(last_tx_map.get(watch_addr) or token.get("last_blum_tx") or "").strip()
-                    last_lt = str(last_lt_map.get(watch_addr) or token.get("last_blum_lt") or "").strip()
+                    txs = sorted([x for x in txs if isinstance(x, dict)], key=_tx_sort_key, reverse=True)
+                    inherit_global = (len(watch_addrs) == 1)
+                    last_tx = str(last_tx_map.get(watch_addr) or (token.get("last_blum_tx") if inherit_global else "") or "").strip()
+                    last_lt = str(last_lt_map.get(watch_addr) or (token.get("last_blum_lt") if inherit_global else "") or "").strip()
 
                     if not last_tx and not last_lt:
                         last_tx_map[watch_addr] = str(_tx_hash(txs[0]) or "").strip()
