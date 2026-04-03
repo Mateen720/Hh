@@ -24,7 +24,9 @@ log = logging.getLogger("spyton_public")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
-POLL_INTERVAL = max(0.35, float(os.getenv("POLL_INTERVAL", "0.45")))
+POLL_INTERVAL = max(0.20, float(os.getenv("POLL_INTERVAL", "0.35")))
+TONAPI_TIMEOUT = max(3.0, float(os.getenv("TONAPI_TIMEOUT", "8")))
+STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "0")).strip().lower() in ("1","true","yes","on")
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600"))))
 STARTUP_HISTORY_GRACE_SEC = max(0, int(float(os.getenv("STARTUP_HISTORY_GRACE_SEC", "120"))))
@@ -2043,16 +2045,16 @@ def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optiona
     """
     headers = tonapi_headers()
     # retry on 429 / transient 5xx
-    for attempt in range(4):
+    for attempt in range(3):
         try:
-            res = requests.get(url, headers=headers, params=params, timeout=20)
+            res = requests.get(url, headers=headers, params=params, timeout=TONAPI_TIMEOUT)
             # If the user provided a key but used the wrong header scheme, try X-API-Key once.
             if res.status_code in (401, 403) and TONAPI_KEY:
                 res = requests.get(
                     url,
                     headers={"X-API-Key": TONAPI_KEY, "Accept": "application/json"},
                     params=params,
-                    timeout=20,
+                    timeout=TONAPI_TIMEOUT,
                 )
 
             if res.status_code == 200:
@@ -2061,7 +2063,7 @@ def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optiona
             # rate limit or temporary server issues: backoff and retry
             if res.status_code in (429, 500, 502, 503, 504):
                 try:
-                    time.sleep(0.45 * (2 ** attempt))
+                    time.sleep(0.20 * (2 ** attempt))
                 except Exception:
                     pass
                 continue
@@ -2070,7 +2072,7 @@ def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optiona
         except Exception:
             # transient network errors
             try:
-                time.sleep(0.25 * (2 ** attempt))
+                time.sleep(0.12 * (2 ** attempt))
             except Exception:
                 pass
             continue
@@ -4799,7 +4801,7 @@ async def poll_once(app: Application):
                 # Fast path first: TonAPI /events on the pool is usually earlier than the export feed.
                 posted_any = False
                 try:
-                    events = await _to_thread(tonapi_account_events, pool, 30)
+                    events = await _to_thread(tonapi_account_events_subject, pool, 12)
                     if isinstance(events, list) and events:
                         last_eid = str(token.get('last_ston_event_id') or '').strip()
                         try:
@@ -4913,12 +4915,11 @@ async def poll_once(app: Application):
                     await post_buy(app, chat_id, token, {"tx": tx, "buyer": maker, "ton": ton_spent, "token_amount": token_received}, source="STON.fi")
                     posted_any = True
 
-                # Fallback for STON.fi v2 swaps (TonAPI tx actions).
-                # Some v2 pools don't appear in the export feed with matching pairId/fields,
-                # but TonAPI actions still include "Swap tokens" / "Stonfi Swap V2".
-                if not posted_any:
+                # Raw pool-tx fallback is slower and can misclassify edge-case sells on some STON pools
+                # (for example CUPRUM-style reversed action payloads). Keep it opt-in only.
+                if (not posted_any) and STON_TX_FALLBACK:
                     try:
-                        txs = await _to_thread(tonapi_account_transactions, pool, 15)
+                        txs = await _to_thread(tonapi_account_transactions, pool, 10)
                         # process oldest -> newest
                         txs = list(reversed(txs))
                         for txo in txs:
