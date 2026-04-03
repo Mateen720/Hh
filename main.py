@@ -3375,6 +3375,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_admin(context.bot, chat.id, user.id):
             await q.answer(_settings_words(_get_group_lang(chat.id, user.id))["admins_only"], show_alert=True)
             return
+        _clear_user_input_states(user.id)
+        _clear_user_input_states(user.id)
         AWAITING[user.id] = {"group_id": chat.id, "stage": "GROUP_ADD", "dex": "both"}
         await context.bot.send_message(chat_id=chat.id, text=_settings_words(_get_group_lang(chat.id, user.id))["paste_ca"])
         return
@@ -3531,6 +3533,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not group_id:
             return
         dex = "ston" if data.startswith("DEX_STON_") else "dedust"
+        _clear_user_input_states(user.id)
         AWAITING[user.id] = {"group_id": group_id, "stage": "CA", "dex": dex}
         await q.edit_message_text(
             "Send the token CA now (EQ… / UQ…) or a supported link (GT/DexS/STON/DeDust).\n\n"
@@ -4183,12 +4186,28 @@ async def _infer_target_group_from_state(user_id: int) -> Optional[int]:
             return None
     return None
 
+def _clear_user_input_states(user_id: int):
+    AWAITING_EDIT_INPUT.pop(user_id, None)
+    AWAITING_SOCIAL.pop(user_id, None)
+    AWAITING_CUSTOM_EMOJI.pop(user_id, None)
+    AWAITING_IMAGE.pop(user_id, None)
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat or not update.effective_user:
         return
     chat = update.effective_chat
     user = update.effective_user
     text = (update.message.text or "").strip()
+
+    cfg_now = AWAITING.get(user.id)
+    awaiting_add = False
+    if isinstance(cfg_now, dict):
+        stage_now = str(cfg_now.get("stage") or "")
+        group_now = int(cfg_now.get("group_id") or 0)
+        if chat.type == "private":
+            awaiting_add = stage_now == "CA" and group_now > 0
+        elif chat.type in ("group", "supergroup"):
+            awaiting_add = stage_now == "GROUP_ADD" and group_now == chat.id
 
     # "ca" shortcut in groups: show currently configured token address (like listing bots)
     if chat.type in ("group", "supergroup") and text.lower() == "ca":
@@ -4231,7 +4250,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-    if user.id in AWAITING_EDIT_INPUT:
+    if user.id in AWAITING_EDIT_INPUT and not awaiting_add:
         cfg = AWAITING_EDIT_INPUT.get(user.id) or {}
         target_chat_id = int(cfg.get("chat_id") or 0)
         field = str(cfg.get("field") or "")
@@ -4324,7 +4343,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # Social link input (Token Settings -> Social Links)
-    if user.id in AWAITING_SOCIAL:
+    if user.id in AWAITING_SOCIAL and not awaiting_add:
         cfg = AWAITING_SOCIAL.get(user.id) or {}
         target_chat_id = int(cfg.get("chat_id") or 0)
         field = str(cfg.get("field") or "telegram")
@@ -4352,6 +4371,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = await _to_thread(resolve_jetton_from_text_sync, text)
     if not addr:
         return
+
+    if awaiting_add:
+        _clear_user_input_states(user.id)
 
     # Optional: token telegram link can be sent together with CA.
     # Example: EQ... https://t.me/YourToken
