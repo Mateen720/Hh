@@ -378,9 +378,8 @@ def ston_event_buy_for_token(ev: Dict[str, Any], token: Dict[str, Any]):
     if ton_leg is None:
         ton_leg = ensure_ton_leg_for_pool(token)
 
-    if token_leg is None and ton_leg in (0, 1):
-        token_leg = 1 - ton_leg
-
+    # Do not infer the token leg from the TON leg alone.
+    # Some STON payloads can make token->TON sells look like buys if we guess here.
     if ton_leg not in (0, 1) or token_leg not in (0, 1) or ton_leg == token_leg:
         return False, 0.0, 0.0
 
@@ -1432,7 +1431,7 @@ I18N: Dict[str, Dict[str, str]] = {
     "start_title": "🚀 *KYRON BuyBot*",
     "start_desc": "Premium buy alerts for STON.fi + DeDust (TON).\n\n• Add to a group\n• Configure token in 10 seconds\n• Clean buy posts + ads support\n\nUse the buttons below:",
     "connected_title": "✅ *KYRON BuyBot connected*",
-    "connected_desc": "Now send the token CA here in DM.\nI will auto-detect *STON.fi* / *DeDust* pools and also watch *Groypad* launchpad flow when no pool is live yet, then start posting buys in your group.\n\nTip: you can also include the token Telegram link in the same message.\nExample:\n`<CA> https://t.me/YourToken`",
+    "connected_desc": "Now send the token CA here in DM.\nI will auto-detect *STON.fi* / *DeDust* pools, then start posting buys in your group.\n\nTip: you can also include the token Telegram link in the same message.\nExample:\n`<CA> https://t.me/YourToken`",
     "lang_set_ok": "Language saved: English ✅",
     "lang_set_ok_ru": "Language saved: Russian ✅",
     "need_admin": "Admins only.",
@@ -1467,7 +1466,7 @@ I18N: Dict[str, Dict[str, str]] = {
     "start_title": "🚀 *KYRON BuyBot*",
     "start_desc": "Премиум-уведомления о покупках для STON.fi + DeDust (TON).\n\n• Добавьте в группу\n• Настройте токен за 10 секунд\n• Чистые buy-посты + поддержка рекламы\n\nИспользуйте кнопки ниже:",
     "connected_title": "✅ *KYRON BuyBot подключён*",
-    "connected_desc": "Теперь отправьте сюда в ЛС адрес токена (CA).\nЯ автоматически найду пулы *STON.fi* / *DeDust* и также буду отслеживать launchpad *Groypad*, если пул ещё не запущен, после чего начну постить покупки в вашей группе.\n\nСовет: можно добавить ссылку на Telegram токена в том же сообщении.\nПример:\n`<CA> https://t.me/YourToken`",
+    "connected_desc": "Теперь отправьте сюда в ЛС адрес токена (CA).\nЯ автоматически найду пулы *STON.fi* / *DeDust*, после чего начну постить покупки в вашей группе.\n\nСовет: можно добавить ссылку на Telegram токена в том же сообщении.\nПример:\n`<CA> https://t.me/YourToken`",
     "lang_set_ok": "Язык сохранён: English ✅",
     "lang_set_ok_ru": "Язык сохранён: Русский ✅",
     "need_admin": "Только для админов.",
@@ -4799,8 +4798,47 @@ async def poll_once(app: Application):
         if settings.get("enable_ston", True) and token.get("ston_pool"):
             pool = token["ston_pool"]
             try:
-                # Fast path first: TonAPI /events on the pool is usually earlier than the export feed.
+                # Fast path first: recent pool transactions, then TonAPI /events.
                 posted_any = False
+                try:
+                    txs_fast = await _to_thread(tonapi_account_transactions, pool, 6)
+                    if isinstance(txs_fast, list) and txs_fast:
+                        last_tx_seen = str(token.get("last_ston_tx") or "").strip()
+                        new_txs = []
+                        ignore_before = effective_ignore_before_ts(token)
+                        for txo in txs_fast:
+                            if not isinstance(txo, dict):
+                                continue
+                            txh = str(_tx_hash(txo) or "").strip()
+                            if last_tx_seen and txh == last_tx_seen:
+                                break
+                            ut = int(txo.get("utime") or 0)
+                            if ignore_before and ut and ut < ignore_before:
+                                continue
+                            if is_stale_buy_ts(ut):
+                                continue
+                            new_txs.append(txo)
+                        for txo in reversed(new_txs):
+                            for b in stonfi_extract_buys_from_tonapi_tx(txo, token["address"]):
+                                ton_amt = float(b.get("ton") or 0.0)
+                                token_amt = float(b.get("token_amount") or 0.0)
+                                if ton_amt < min_buy:
+                                    continue
+                                txh = str(b.get("tx") or _tx_hash(txo) or "").strip()
+                                dedupe_key = ('tx:' + _normalize_tx_hash_to_hex(txh)) if txh else ('ston-tx:' + str(pool) + ':' + str(txo.get('lt') or ''))
+                                if not dedupe_ok(chat_id, dedupe_key):
+                                    continue
+                                if settings.get('burst_mode', True) and burst['count'] >= max_msgs:
+                                    continue
+                                burst['count'] += 1
+                                await post_buy(app, chat_id, token, {'tx': txh, 'buyer': b.get('buyer'), 'ton': ton_amt, 'token_amount': token_amt}, source='STON.fi v2')
+                                posted_any = True
+                        newest_tx0 = txs_fast[0]
+                        newest_txh0 = str(_tx_hash(newest_tx0) or '').strip()
+                        if newest_txh0:
+                            token['last_ston_tx'] = newest_txh0
+                except Exception as _e:
+                    log.debug('STON TonAPI tx fast path err chat=%s %s', chat_id, _e)
                 try:
                     events = await _to_thread(tonapi_account_events_subject, pool, 6)
                     if isinstance(events, list) and events:
