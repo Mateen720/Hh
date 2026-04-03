@@ -1815,6 +1815,8 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
     try:
         bucket = SEEN.setdefault(str(chat_id), {})
         newest_ston = None
+        newest_ston_eid = None
+        newest_ston_ts = None
         newest_dedust = None
         newest_blum_eid = None
         newest_blum_ts = None
@@ -1831,6 +1833,17 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                     bucket[f"ston:{ston_pool}:{txhash}"] = int(time.time())
                     if newest_ston is None:
                         newest_ston = txhash  # first item is newest
+            try:
+                ston_events0 = await _to_thread(tonapi_account_events, ston_pool, 40)
+                if isinstance(ston_events0, list) and ston_events0:
+                    newest0 = ston_events0[0]
+                    newest_ston_eid = str(newest0.get('event_id') or newest0.get('id') or '').strip() or newest_ston_eid
+                    try:
+                        newest_ston_ts = int(newest0.get('timestamp') or 0) or newest_ston_ts
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         # DeDust (warmup by latest trade ids and tx hashes where available)
         if dedust_pool:
@@ -1931,6 +1944,10 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
         if isinstance(tok, dict):
             if newest_ston:
                 tok["last_ston_tx"] = newest_ston
+            if newest_ston_eid:
+                tok["last_ston_event_id"] = newest_ston_eid
+            if newest_ston_ts:
+                tok["last_ston_event_ts"] = int(newest_ston_ts)
             if newest_dedust:
                 tok["last_dedust_trade"] = newest_dedust
             if newest_dedust_ts:
@@ -2577,17 +2594,81 @@ def _to_float(x) -> float:
     except Exception:
         return 0.0
 
-def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
-    """Heuristic buy parser from TonAPI tx actions.
-    BUY = TON -> token_addr.
+def _stonfi_extract_buys_from_actions(actions: Any, token_addr: str, tx_hash: str = "") -> List[Dict[str, Any]]:
+    """Strict STON buy parser from TonAPI action lists.
+
+    Only accepts TON -> configured token. It never trusts a loose "contains ton"
+    check, and it hard-rejects token -> TON sells.
     """
     out: List[Dict[str, Any]] = []
-    tx_hash = _tx_hash(tx)
-
-    actions = tx.get("actions")
     if not isinstance(actions, list):
-        actions = []
+        return out
 
+    def _asset_addr(x: Any) -> str:
+        if isinstance(x, dict):
+            addr = x.get("address") or x.get("master") or x.get("jetton_master") or x.get("jettonMaster") or ""
+            return str(addr).strip()
+        return ""
+
+    def _is_ton_asset(x: Any) -> bool:
+        if not isinstance(x, dict):
+            return False
+        t = str(x.get("type") or x.get("kind") or x.get("asset_type") or "").strip().lower()
+        if t in ("ton", "native", "native_ton"):
+            return True
+        sym = str(x.get("symbol") or x.get("ticker") or x.get("name") or "").strip().lower()
+        if sym in ("ton", "wton", "pton"):
+            return True
+        addr = _asset_addr(x)
+        if addr:
+            return False
+        native = x.get("is_ton") or x.get("isTon") or x.get("native")
+        if native is True:
+            return True
+        try:
+            dec = x.get("decimals")
+            if dec is not None and str(dec).strip() != "":
+                dec_i = int(str(dec).strip())
+                asset_type = str(x.get("asset_type") or x.get("type") or "").strip().lower()
+                if dec_i == 9 and asset_type in ("ton", "native", "native_ton"):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _parse_amount(raw: Any, asset: Any) -> Optional[float]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            val = float(raw)
+        else:
+            s = str(raw).strip()
+            if not s:
+                return None
+            if s.replace("-", "").isdigit():
+                try:
+                    val = float(int(s))
+                except Exception:
+                    val = _to_float(s)
+            else:
+                val = _to_float(s)
+        dec = None
+        if isinstance(asset, dict):
+            d = asset.get("decimals")
+            if isinstance(d, int):
+                dec = d
+            else:
+                try:
+                    dec = int(d)
+                except Exception:
+                    dec = None
+        if dec is not None:
+            raw_s = str(raw).strip() if raw is not None else ""
+            if raw_s and raw_s.replace("-", "").isdigit() and abs(val) >= 10 ** (dec + 2):
+                val = val / (10 ** dec)
+        return val
+
+    token_addr_s = str(token_addr or "").strip()
     for a in actions:
         if not isinstance(a, dict):
             continue
@@ -2595,11 +2676,9 @@ def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> L
         aa = dict(a)
         if isinstance(payload, dict):
             aa.update(payload)
-
         at = _action_type(aa).lower()
         if "swap" not in at and "dex" not in at:
             continue
-
         dex = aa.get("dex")
         dex_name = ""
         if isinstance(dex, dict):
@@ -2609,121 +2688,44 @@ def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> L
 
         in_asset = aa.get("asset_in") or aa.get("assetIn") or aa.get("in") or {}
         out_asset = aa.get("asset_out") or aa.get("assetOut") or aa.get("out") or {}
-
-        def _asset_addr(x: Any) -> str:
-            if isinstance(x, dict):
-                addr = x.get("address") or x.get("master") or x.get("jetton_master") or x.get("jettonMaster") or ""
-                return str(addr)
-            return ""
-
-        def _is_ton_asset(x: Any) -> bool:
-            """Strict native-TON detector.
-
-            The previous fallback treated any dict whose string representation contained
-            "ton" as TON, which falsely matched token payloads from STON.fi actions and
-            caused sells to be posted as buys.
-            """
-            if not isinstance(x, dict):
-                return False
-            t = str(x.get("type") or x.get("kind") or x.get("asset_type") or "").strip().lower()
-            if t in ("ton", "native", "native_ton"):
-                return True
-            sym = str(x.get("symbol") or x.get("ticker") or x.get("name") or "").strip().lower()
-            if sym in ("ton", "wton", "pton"):
-                return True
-            addr = str(_asset_addr(x) or "").strip()
-            if addr:
-                return False
-            native = x.get("is_ton") or x.get("isTon") or x.get("native")
-            if native is True:
-                return True
-            try:
-                dec = x.get("decimals")
-                if dec is not None and str(dec).strip() != "":
-                    dec_i = int(str(dec).strip())
-                    asset_type = str(x.get("asset_type") or x.get("type") or "").strip().lower()
-                    if dec_i == 9 and asset_type in ("ton", "native", "native_ton"):
-                        return True
-            except Exception:
-                pass
-            return False
-
-        def _parse_amount(raw: Any, asset: Any) -> Optional[float]:
-            """Handle both already-decimal numbers and raw on-chain integers."""
-            if raw is None:
-                return None
-            # numeric
-            if isinstance(raw, (int, float)):
-                val = float(raw)
-            else:
-                s = str(raw).strip()
-                if not s:
-                    return None
-                # if it looks like an integer string, keep as int-like
-                if s.replace("-", "").isdigit():
-                    try:
-                        val = float(int(s))
-                    except Exception:
-                        val = _to_float(s)
-                else:
-                    val = _to_float(s)
-
-            # scale if it looks like a raw integer
-            dec = None
-            if isinstance(asset, dict):
-                d = asset.get("decimals")
-                if isinstance(d, int):
-                    dec = d
-                else:
-                    try:
-                        dec = int(d)
-                    except Exception:
-                        dec = None
-
-            if dec is not None:
-                # If we got a big integer-ish value and no decimal point in original, assume raw.
-                raw_s = str(raw).strip() if raw is not None else ""
-                if raw_s and raw_s.replace("-", "").isdigit() and abs(val) >= 10 ** (dec + 2):
-                    val = val / (10 ** dec)
-
-            return val
-
         in_addr = _asset_addr(in_asset)
         out_addr = _asset_addr(out_asset)
+        amt_in = _parse_amount(aa.get("amount_in") or aa.get("amountIn") or aa.get("in_amount"), in_asset)
+        amt_out = _parse_amount(aa.get("amount_out") or aa.get("amountOut") or aa.get("out_amount"), out_asset)
 
-        amt_in = _parse_amount(aa.get("amount_in") or aa.get("amountIn"), in_asset)
-        amt_out = _parse_amount(aa.get("amount_out") or aa.get("amountOut"), out_asset)
-
-        # BUY must be TON -> token.
-        # Also hard-reject the inverse token -> TON case so sells never leak through
-        # when TonAPI action payloads are incomplete or oddly shaped.
-        token_addr_s = str(token_addr or "").strip()
-        in_is_token = bool(token_addr_s and str(in_addr) == token_addr_s)
-        out_is_token = bool(token_addr_s and str(out_addr) == token_addr_s)
+        in_is_token = bool(token_addr_s and in_addr == token_addr_s)
+        out_is_token = bool(token_addr_s and out_addr == token_addr_s)
+        in_is_ton = _is_ton_asset(in_asset)
         out_is_ton = _is_ton_asset(out_asset)
+
+        # Never allow token->TON sells.
         if in_is_token and out_is_ton:
             continue
-        if not (_is_ton_asset(in_asset) and out_is_token):
+        # Only TON->token buys are allowed.
+        if not (in_is_ton and out_is_token):
             continue
-
         ton_in = amt_in
         jet_out = amt_out
         if not ton_in or not jet_out:
             continue
-
-        buyer = (aa.get("user") or aa.get("sender") or aa.get("initiator") or aa.get("from") or "")
+        buyer = (aa.get("user") or aa.get("sender") or aa.get("initiator") or aa.get("from") or aa.get("trader") or "")
         if isinstance(buyer, dict):
             buyer = buyer.get("address") or ""
-        buyer = str(buyer)
-
         out.append({
             "tx": tx_hash,
-            "buyer": buyer,
+            "buyer": str(buyer or "").strip(),
             "ton": ton_in,
             "token_amount": jet_out,
         })
-
     return out
+
+def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
+    """Heuristic buy parser from TonAPI tx actions. BUY = TON -> token_addr."""
+    return _stonfi_extract_buys_from_actions(tx.get("actions"), token_addr, _tx_hash(tx))
+
+def stonfi_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
+    """Strict STON buy parser from TonAPI account events for fast pool monitoring."""
+    return _stonfi_extract_buys_from_actions((ev or {}).get("actions"), token_addr, tonapi_event_tx_hash(ev))
 
 def dedust_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
     """TonAPI events endpoint sometimes provides swap action info too."""
@@ -3206,6 +3208,8 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "init_done": True,
         "paused": False,
         "last_ston_tx": None,
+        "last_ston_event_id": None,
+        "last_ston_event_ts": None,
         "last_dedust_trade": None,
         "ston_last_block": None,
         "ignore_before_ts": int(time.time()),
@@ -4681,6 +4685,8 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "init_done": False,
         "paused": False,
         "last_ston_tx": None,
+        "last_ston_event_id": None,
+        "last_ston_event_ts": None,
         "last_dedust_trade": None,
         "ston_last_block": None,
         "ignore_before_ts": int(time.time()),
@@ -4786,10 +4792,71 @@ async def poll_once(app: Application):
             burst["window_start"] = now
             burst["count"] = 0
 
-        # STON (STON exported events by blocks)
+        # STON fast path (TonAPI pool events) + STON exported events by blocks
         if settings.get("enable_ston", True) and token.get("ston_pool"):
             pool = token["ston_pool"]
             try:
+                # Fast path first: TonAPI /events on the pool is usually earlier than the export feed.
+                posted_any = False
+                try:
+                    events = await _to_thread(tonapi_account_events, pool, 30)
+                    if isinstance(events, list) and events:
+                        last_eid = str(token.get('last_ston_event_id') or '').strip()
+                        try:
+                            last_ets = int(token.get('last_ston_event_ts') or 0)
+                        except Exception:
+                            last_ets = 0
+                        new_events = []
+                        if not last_eid and not last_ets:
+                            newest = events[0]
+                            eid0 = str(newest.get('event_id') or newest.get('id') or '').strip()
+                            ts0 = int(newest.get('timestamp') or 0)
+                            if eid0:
+                                token['last_ston_event_id'] = eid0
+                            if ts0:
+                                token['last_ston_event_ts'] = ts0
+                        else:
+                            ignore_before = effective_ignore_before_ts(token)
+                            for ev in events:
+                                if not isinstance(ev, dict):
+                                    continue
+                                eid = str(ev.get('event_id') or ev.get('id') or '').strip()
+                                ts = int(ev.get('timestamp') or 0)
+                                if last_eid and eid == last_eid:
+                                    break
+                                if last_ets and ts and ts <= last_ets:
+                                    continue
+                                if ignore_before and ts and ts < ignore_before:
+                                    continue
+                                if is_stale_buy_ts(ts):
+                                    continue
+                                new_events.append(ev)
+                            for ev in reversed(new_events):
+                                buys = stonfi_extract_buys_from_tonapi_event(ev, token['address'])
+                                for b in buys:
+                                    ton_amt = float(b.get('ton') or 0.0)
+                                    token_amt = float(b.get('token_amount') or 0.0)
+                                    if ton_amt < min_buy:
+                                        continue
+                                    txh = str(b.get('tx') or '').strip()
+                                    dedupe_key = ('tx:' + _normalize_tx_hash_to_hex(txh)) if txh else ('ston-event:' + str(pool) + ':' + str(ev.get('event_id') or ev.get('id') or ''))
+                                    if not dedupe_ok(chat_id, dedupe_key):
+                                        continue
+                                    if settings.get('burst_mode', True) and burst['count'] >= max_msgs:
+                                        continue
+                                    burst['count'] += 1
+                                    await post_buy(app, chat_id, token, {'tx': txh, 'buyer': b.get('buyer'), 'ton': ton_amt, 'token_amount': token_amt}, source='STON.fi v2')
+                                    posted_any = True
+                            newest = events[0]
+                            eid0 = str(newest.get('event_id') or newest.get('id') or '').strip()
+                            ts0 = int(newest.get('timestamp') or 0)
+                            if eid0:
+                                token['last_ston_event_id'] = eid0
+                            if ts0:
+                                token['last_ston_event_ts'] = ts0
+                except Exception as _e:
+                    log.debug('STON TonAPI events err chat=%s %s', chat_id, _e)
+
                 latest = await _to_thread(ston_latest_block)
                 if latest is None:
                     raise RuntimeError("no latest block")
@@ -4810,7 +4877,6 @@ async def poll_once(app: Application):
                 token["ston_last_block"] = to_b
                 # filter swaps for this pool (STON export feed)
                 # ton_leg is determined per-event to avoid base/quote ordering issues
-                posted_any = False
                 for ev in evs:
                     if (str(ev.get("eventType") or "").lower() != "swap"):
                         continue
