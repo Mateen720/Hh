@@ -2788,7 +2788,7 @@ def _customize_text(chat_id: int) -> str:
     tok = g.get("token") if isinstance(g, dict) else None
     words = _settings_words(_lang_for_chat(chat_id))
     if not isinstance(tok, dict):
-        return words["no_token"]
+        return html.escape(words["no_token"])
     addr = str(tok.get("address") or "")
     name = str(tok.get("name") or tok.get("symbol") or "Token")
     return (
@@ -2810,13 +2810,14 @@ def _customize_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         tg = str(tok.get("telegram") or "").strip()
     tg_disp = tg if tg else "()"
     emo = str(s.get("strength_emoji") or "🔥")
+    emo_disp = "Premium ✅" if "<tg-emoji" in emo else emo[:8]
     media = words["set"] if (s.get("buy_image_file_id") or "").strip() else "()"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(words["tab"], callback_data="TAB_INFO")],
         [InlineKeyboardButton(words["buy_step"], callback_data="INFO_STEP"), InlineKeyboardButton(f"{words['edit']} ({step})", callback_data="EDIT_STEP")],
         [InlineKeyboardButton(words["min_buy"], callback_data="INFO_MIN"), InlineKeyboardButton(f"{words['edit']} ({minv})", callback_data="EDIT_MIN")],
         [InlineKeyboardButton(words["link"], callback_data="INFO_LINK"), InlineKeyboardButton(f"{words['edit']} ({tg_disp})", callback_data="EDIT_LINK")],
-        [InlineKeyboardButton(words["emoji"], callback_data="INFO_EMOJI"), InlineKeyboardButton(f"{words['edit']} ({emo})", callback_data="EDIT_EMOJI")],
+        [InlineKeyboardButton(words["emoji"], callback_data="INFO_EMOJI"), InlineKeyboardButton(f"{words['edit']} ({emo_disp})", callback_data="EDIT_EMOJI")],
         [InlineKeyboardButton(words["media"], callback_data="INFO_MEDIA"), InlineKeyboardButton(f"{words['edit']} ({media})", callback_data="EDIT_MEDIA")],
         [InlineKeyboardButton(words["return"], callback_data="RETURN_HOME")],
     ])
@@ -2825,9 +2826,9 @@ async def send_customize_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
     text = _customize_text(chat_id)
     kb = _customize_keyboard(chat_id)
     if edit:
-        await msg.edit_text(text, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
+        await msg.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
     else:
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 async def _send_customize_prompt(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str):
     return await context.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
@@ -4158,7 +4159,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_customize_panel(target_chat_id, context, update.message)
                 return
             if field == "emoji":
-                s["strength_emoji"] = text[:12]
+                raw_emoji = (update.message.text or "").strip()
+                if len(raw_emoji) > 180:
+                    await update.message.reply_text("Emoji text too long. Send a single emoji or a <tg-emoji ...> tag.")
+                    return
+                if "<tg-emoji" not in raw_emoji and len(raw_emoji) > 12:
+                    await update.message.reply_text("Send a single emoji or Telegram premium custom emoji in <tg-emoji ...> format.")
+                    return
+                s["strength_emoji"] = raw_emoji
                 save_groups()
                 AWAITING_EDIT_INPUT.pop(user.id, None)
                 try:
@@ -4733,9 +4741,9 @@ async def poll_once(app: Application):
                         for txo in txs:
                             ignore_before = effective_ignore_before_ts(token)
                             ut = int(txo.get("utime") or 0)
-                            if ignore_before and ut and ut < ignore_before:
+                            if ut <= 0:
                                 continue
-                            if is_stale_buy_ts(ut):
+                            if ignore_before and ut and ut < ignore_before:
                                 continue
                             if is_stale_buy_ts(ut):
                                 continue
@@ -4826,8 +4834,12 @@ async def poll_once(app: Application):
                         auth_ts = int(pool_tx_utime_by_hash.get(txh_raw) or 0)
                     if (not auth_ts) and lt_lookup:
                         auth_ts = int(pool_tx_utime_by_lt.get(lt_lookup) or 0)
-                    if auth_ts > 0:
-                        ts_i = auth_ts
+                    # Do not trust DeDust /trades timestamps by themselves for replay protection.
+                    # If we cannot map a trade to a real on-chain utime from TonAPI, skip it here;
+                    # TonAPI events fallback below will still catch fresh swaps.
+                    if auth_ts <= 0:
+                        continue
+                    ts_i = auth_ts
                     # lt/trade_id (prefer numeric)
                     lt_raw = (tr.get("lt") or b.get("trade_id") or tr.get("id") or "")
                     try:
@@ -4955,6 +4967,8 @@ async def poll_once(app: Application):
                                     token['last_dedust_event_id'] = eid0
                                 if ts0:
                                     token['last_dedust_event_ts'] = ts0
+                                if not ignore_before:
+                                    token['ignore_before_ts'] = int(time.time())
                             else:
                                 new_events = []
                                 for ev in events:
