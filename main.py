@@ -29,6 +29,7 @@ TONAPI_TIMEOUT = max(2.0, float(os.getenv("TONAPI_TIMEOUT", "4")))
 STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "0")).strip().lower() in ("1","true","yes","on")
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600"))))
+FAST_POST_MODE = str(os.getenv("FAST_POST_MODE", "1")).strip().lower() in ("1","true","yes","on")
 STARTUP_HISTORY_GRACE_SEC = max(0, int(float(os.getenv("STARTUP_HISTORY_GRACE_SEC", "120"))))
 PROCESS_START_TS = int(time.time())
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
@@ -5452,6 +5453,12 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     except Exception:
         refresh_remote_market = True
 
+    # Fast-post mode: do not block the alert on remote market refresh when we
+    # already have cached stats. This is the main reason messages can arrive
+    # tens of seconds late even though the tx is already detected.
+    if FAST_POST_MODE and (price_usd is not None or liq_usd is not None or mc_usd is not None):
+        refresh_remote_market = False
+
     if pool_for_market and refresh_remote_market:
         pinfo = gecko_pool_info(pool_for_market)
         if pinfo:
@@ -5511,6 +5518,9 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         refresh_holders = (_now - int(token.get("_holders_refresh_ts") or 0)) >= 45
     except Exception:
         refresh_holders = True
+
+    if FAST_POST_MODE and holders is not None:
+        refresh_holders = False
 
     if jetton_addr and refresh_holders:
         # TonAPI Jetton info sometimes includes holders_count. If not, fall back
@@ -5578,7 +5588,14 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         except Exception:
             pass
 
-    ton_usd = ton_usd_price()
+    ton_usd = None
+    try:
+        if TON_PRICE_CACHE.get("usd") is not None and _now - int(TON_PRICE_CACHE.get("ts") or 0) < 600:
+            ton_usd = float(TON_PRICE_CACHE.get("usd"))
+        elif not FAST_POST_MODE:
+            ton_usd = ton_usd_price()
+    except Exception:
+        ton_usd = None
     if ton_usd and ton_usd > 0:
         try:
             if (price_usd is None) and ton_amt > 0 and tok_amt and float(tok_amt) > 0:
