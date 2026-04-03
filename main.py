@@ -140,7 +140,7 @@ PREMIUM_EMOJI_DEFAULTS = {
     "title": '<tg-emoji emoji-id="5260547274957672345">🛡️</tg-emoji>',
     "dex": '<tg-emoji emoji-id="5321530952952860238">✨</tg-emoji>',
     "spent": '<tg-emoji emoji-id="5377620962390857342">💲</tg-emoji>',
-    "got": '<tg-emoji emoji-id="5265173719239643202">↔️</tg-emoji>',
+    "got": '<tg-emoji emoji-id="5262577510293457429">↔️</tg-emoji>',
     "wallet": '<tg-emoji emoji-id="5260547274957672345">🫂</tg-emoji>',
     "price": '<tg-emoji emoji-id="5224257782013769471">🗝️</tg-emoji>',
     "mcap": '<tg-emoji emoji-id="5451882707875276247">📈</tg-emoji>',
@@ -310,6 +310,92 @@ def ston_event_is_buy(ev: Dict[str, Any], ton_leg: int):
             return True, a1_in, a0_out
         # SELL would be a0_in > 0 and a1_out > 0 (ignore)
         return False, 0.0, 0.0
+
+    return False, 0.0, 0.0
+
+def ston_event_buy_for_token(ev: Dict[str, Any], token: Dict[str, Any]):
+    """Safer STON export-event buy detector bound to the configured token.
+
+    Prevents sells from leaking through when the feed labels the TON leg incorrectly.
+    We first identify the configured token leg (by address or symbol), then require the
+    opposite leg to be TON-like. Only TON->token is accepted.
+    """
+    def _norm_addr(v: Any) -> str:
+        return str(v or "").strip()
+
+    def _sym(v: Any) -> str:
+        return str(v or "").strip().upper()
+
+    tok_addr = _norm_addr((token or {}).get("address"))
+    tok_sym = _sym((token or {}).get("symbol") or (token or {}).get("name"))
+
+    def _leg_addr(idx: int) -> str:
+        keys = [f"token{idx}Address", f"token{idx}_address", f"token{idx}Master", f"token{idx}_master"]
+        for k in keys:
+            v = ev.get(k)
+            if v:
+                return _norm_addr(v)
+        obj = ev.get(f"token{idx}")
+        if isinstance(obj, dict):
+            for k in ("address", "master", "jetton_master", "jettonMaster"):
+                v = obj.get(k)
+                if v:
+                    return _norm_addr(v)
+        return ""
+
+    def _leg_sym(idx: int) -> str:
+        v = ev.get(f"token{idx}Symbol") or ev.get(f"token{idx}_symbol") or ev.get(f"symbol{idx}")
+        obj = ev.get(f"token{idx}")
+        if isinstance(obj, dict):
+            v = obj.get("symbol") or obj.get("ticker") or v
+        return _sym(v)
+
+    leg0_addr = _leg_addr(0)
+    leg1_addr = _leg_addr(1)
+    leg0_sym = _leg_sym(0)
+    leg1_sym = _leg_sym(1)
+
+    token_leg = None
+    if tok_addr:
+        if leg0_addr == tok_addr:
+            token_leg = 0
+        elif leg1_addr == tok_addr:
+            token_leg = 1
+    if token_leg is None and tok_sym:
+        if leg0_sym == tok_sym and leg1_sym in {x.upper() for x in TON_LIKE_SYMS}:
+            token_leg = 0
+        elif leg1_sym == tok_sym and leg0_sym in {x.upper() for x in TON_LIKE_SYMS}:
+            token_leg = 1
+
+    ton_leg = None
+    if leg0_sym in {x.upper() for x in TON_LIKE_SYMS}:
+        ton_leg = 0
+    elif leg1_sym in {x.upper() for x in TON_LIKE_SYMS}:
+        ton_leg = 1
+    if ton_leg is None:
+        ton_leg = ensure_ton_leg_for_pool(token)
+
+    if token_leg is None and ton_leg in (0, 1):
+        token_leg = 1 - ton_leg
+
+    if ton_leg not in (0, 1) or token_leg not in (0, 1) or ton_leg == token_leg:
+        return False, 0.0, 0.0
+
+    a0_in = _to_float(ev.get("amount0In"))
+    a0_out = _to_float(ev.get("amount0Out"))
+    a1_in = _to_float(ev.get("amount1In"))
+    a1_out = _to_float(ev.get("amount1Out"))
+
+    # Hard reject token->TON sells first.
+    if token_leg == 0 and a0_in > 0 and a1_out > 0:
+        return False, 0.0, 0.0
+    if token_leg == 1 and a1_in > 0 and a0_out > 0:
+        return False, 0.0, 0.0
+
+    if ton_leg == 0 and token_leg == 1 and a0_in > 0 and a1_out > 0:
+        return True, a0_in, a1_out
+    if ton_leg == 1 and token_leg == 0 and a1_in > 0 and a0_out > 0:
+        return True, a1_in, a0_out
 
     return False, 0.0, 0.0
 
@@ -2531,17 +2617,35 @@ def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> L
             return ""
 
         def _is_ton_asset(x: Any) -> bool:
+            """Strict native-TON detector.
+
+            The previous fallback treated any dict whose string representation contained
+            "ton" as TON, which falsely matched token payloads from STON.fi actions and
+            caused sells to be posted as buys.
+            """
             if not isinstance(x, dict):
                 return False
-            t = str(x.get("type") or x.get("kind") or x.get("asset_type") or "").lower()
-            if t == "ton":
+            t = str(x.get("type") or x.get("kind") or x.get("asset_type") or "").strip().lower()
+            if t in ("ton", "native", "native_ton"):
                 return True
-            sym = str(x.get("symbol") or x.get("ticker") or x.get("name") or "").lower()
-            if sym in ("ton","wton","pton"):
+            sym = str(x.get("symbol") or x.get("ticker") or x.get("name") or "").strip().lower()
+            if sym in ("ton", "wton", "pton"):
                 return True
-            # TonAPI sometimes stores ton as a dict without address, but with decimals=9
-            if _asset_addr(x) in ("", None) and str(x).lower().find("ton") != -1:
+            addr = str(_asset_addr(x) or "").strip()
+            if addr:
+                return False
+            native = x.get("is_ton") or x.get("isTon") or x.get("native")
+            if native is True:
                 return True
+            try:
+                dec = x.get("decimals")
+                if dec is not None and str(dec).strip() != "":
+                    dec_i = int(str(dec).strip())
+                    asset_type = str(x.get("asset_type") or x.get("type") or "").strip().lower()
+                    if dec_i == 9 and asset_type in ("ton", "native", "native_ton"):
+                        return True
+            except Exception:
+                pass
             return False
 
         def _parse_amount(raw: Any, asset: Any) -> Optional[float]:
@@ -2590,8 +2694,16 @@ def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> L
         amt_in = _parse_amount(aa.get("amount_in") or aa.get("amountIn"), in_asset)
         amt_out = _parse_amount(aa.get("amount_out") or aa.get("amountOut"), out_asset)
 
-        # BUY must be TON -> token
-        if not (_is_ton_asset(in_asset) and str(out_addr) == str(token_addr)):
+        # BUY must be TON -> token.
+        # Also hard-reject the inverse token -> TON case so sells never leak through
+        # when TonAPI action payloads are incomplete or oddly shaped.
+        token_addr_s = str(token_addr or "").strip()
+        in_is_token = bool(token_addr_s and str(in_addr) == token_addr_s)
+        out_is_token = bool(token_addr_s and str(out_addr) == token_addr_s)
+        out_is_ton = _is_ton_asset(out_asset)
+        if in_is_token and out_is_ton:
+            continue
+        if not (_is_ton_asset(in_asset) and out_is_token):
             continue
 
         ton_in = amt_in
@@ -2668,12 +2780,19 @@ def dedust_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -
             return _to_float(s)
 
         in_is_ton = _is_ton_asset(in_asset)
+        in_addr = ""
+        if isinstance(in_asset, dict):
+            in_addr = str(in_asset.get("address") or in_asset.get("master") or "")
         out_addr = ""
         out_symbol = ""
         if isinstance(out_asset, dict):
             out_addr = str(out_asset.get("address") or out_asset.get("master") or "")
             out_symbol = str(out_asset.get("symbol") or out_asset.get("ticker") or "")
+        out_is_ton = _is_ton_asset(out_asset)
 
+        # Hard reject token -> TON sells.
+        if in_addr == token_addr and out_is_ton:
+            continue
         if not (in_is_ton and out_addr == token_addr):
             continue
 
@@ -4712,11 +4831,9 @@ async def poll_once(app: Application):
                     a0_out = _to_float(ev.get("amount0Out"))
                     a1_in = _to_float(ev.get("amount1In"))
                     a1_out = _to_float(ev.get("amount1Out"))
-                    # Determine which leg is TON using event symbols (prevents sells being posted as buys)
-                    ton_leg = ston_event_ton_leg(ev)
-                    if ton_leg is None:
-                        ton_leg = ensure_ton_leg_for_pool(token)
-                    is_buy, ton_spent, token_received = ston_event_is_buy(ev, ton_leg if ton_leg in (0,1) else -1)
+                    # Safer event-bound buy detection: bind the swap to the configured token
+                    # so token->TON sells never leak through as buys.
+                    is_buy, ton_spent, token_received = ston_event_buy_for_token(ev, token)
                     if not is_buy:
                         continue
                     if ton_spent < min_buy:
