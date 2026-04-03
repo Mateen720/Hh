@@ -2601,6 +2601,10 @@ def _stonfi_extract_buys_from_actions(actions: Any, token_addr: str, tx_hash: st
 
     Only accepts TON -> configured token. It never trusts a loose "contains ton"
     check, and it hard-rejects token -> TON sells.
+
+    Important: if *any* swap action in the tx clearly shows configured-token -> TON,
+    treat the whole tx as a sell and return no buys. This prevents mixed action lists
+    (swap + TON refund / transfer noise) from leaking sells through as buys.
     """
     out: List[Dict[str, Any]] = []
     if not isinstance(actions, list):
@@ -2671,6 +2675,34 @@ def _stonfi_extract_buys_from_actions(actions: Any, token_addr: str, tx_hash: st
         return val
 
     token_addr_s = str(token_addr or "").strip()
+
+    # Pre-scan: any explicit token->TON swap means this tx is a sell for the
+    # configured token, so never emit a buy from another noisy action in the same tx.
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        payload = a.get(a.get('type') or a.get('action') or a.get('name'))
+        aa = dict(a)
+        if isinstance(payload, dict):
+            aa.update(payload)
+        at = _action_type(aa).lower()
+        if "swap" not in at and "dex" not in at:
+            continue
+        dex = aa.get("dex")
+        dex_name = ""
+        if isinstance(dex, dict):
+            dex_name = str(dex.get("name") or dex.get("title") or dex.get("id") or "").lower()
+        if dex_name and "ston" not in dex_name:
+            continue
+        in_asset = aa.get("asset_in") or aa.get("assetIn") or aa.get("in") or {}
+        out_asset = aa.get("asset_out") or aa.get("assetOut") or aa.get("out") or {}
+        in_addr = _asset_addr(in_asset)
+        out_addr = _asset_addr(out_asset)
+        in_is_token = bool(token_addr_s and in_addr == token_addr_s)
+        out_is_ton = _is_ton_asset(out_asset)
+        if in_is_token and out_is_ton:
+            return []
+
     for a in actions:
         if not isinstance(a, dict):
             continue
@@ -5005,11 +5037,79 @@ async def poll_once(app: Application):
             except Exception as e:
                 log.debug("STON poll err chat=%s %s", chat_id, e)
 
-        # DeDust (DeDust API trades)
+        # DeDust
         if settings.get("enable_dedust", True) and token.get("dedust_pool"):
             pool = token["dedust_pool"]
             try:
-                trades = await _to_thread(dedust_get_trades, pool, 40)
+                posted_any = False
+                ignore_before = effective_ignore_before_ts(token)
+
+                # Fast path first: TonAPI subject-only events are usually available earlier
+                # than DeDust /trades. This lets the bot post closer to the actual tx time.
+                try:
+                    events_fast = await _to_thread(tonapi_account_events_subject, pool, 30)
+                    if isinstance(events_fast, list) and events_fast:
+                        last_eid = str(token.get('last_dedust_event_id') or '').strip()
+                        try:
+                            last_ets = int(token.get('last_dedust_event_ts') or 0)
+                        except Exception:
+                            last_ets = 0
+                        if not last_eid and not last_ets:
+                            newest = events_fast[0]
+                            eid0 = str(newest.get('event_id') or newest.get('id') or '').strip()
+                            ts0 = int(newest.get('timestamp') or 0)
+                            if eid0:
+                                token['last_dedust_event_id'] = eid0
+                            if ts0:
+                                token['last_dedust_event_ts'] = ts0
+                            if not ignore_before:
+                                token['ignore_before_ts'] = int(time.time())
+                        else:
+                            new_events = []
+                            for ev in events_fast:
+                                if not isinstance(ev, dict):
+                                    continue
+                                eid = str(ev.get('event_id') or ev.get('id') or '').strip()
+                                ts = int(ev.get('timestamp') or 0)
+                                if last_eid and eid == last_eid:
+                                    break
+                                if last_ets and ts and ts <= last_ets:
+                                    continue
+                                if ignore_before and ts and ts < ignore_before:
+                                    continue
+                                if is_stale_buy_ts(ts):
+                                    continue
+                                new_events.append(ev)
+                            for ev in reversed(new_events):
+                                buys = dedust_buys_from_tonapi_event(ev, token['address'], pool)
+                                for b in buys:
+                                    ton_amt = float(b.get('ton') or 0.0)
+                                    if ton_amt < min_buy:
+                                        continue
+                                    txh = _normalize_tx_hash_to_hex(b.get('tx') or '')
+                                    dedupe_key = ('tx:' + txh) if txh else ('dedust:' + str(pool) + ':' + str(b.get('tx')))
+                                    if not dedupe_ok(chat_id, dedupe_key):
+                                        continue
+                                    if settings.get('burst_mode', True) and burst['count'] >= max_msgs:
+                                        continue
+                                    burst['count'] += 1
+                                    await post_buy(app, chat_id, token, {
+                                        'tx': b.get('tx'),
+                                        'buyer': b.get('buyer'),
+                                        'ton': ton_amt,
+                                        'token_amount': float(b.get('token_amount') or 0.0),
+                                    }, source='DeDust')
+                                    posted_any = True
+                                eid_new = str(ev.get('event_id') or ev.get('id') or '').strip()
+                                ts_new = int(ev.get('timestamp') or 0)
+                                if eid_new:
+                                    token['last_dedust_event_id'] = eid_new
+                                if ts_new:
+                                    token['last_dedust_event_ts'] = ts_new
+                except Exception as _e:
+                    log.debug('DeDust TonAPI fast events err chat=%s %s', chat_id, _e)
+
+                trades = [] if posted_any else await _to_thread(dedust_get_trades, pool, 40)
                 if not isinstance(trades, list):
                     trades = []
                 # Build an authoritative utime map from TonAPI pool txs.
@@ -5086,9 +5186,6 @@ async def poll_once(app: Application):
                 except Exception:
                     last_ts = 0
 
-                ignore_before = effective_ignore_before_ts(token)
-
-                posted_any = False
 
                 # If DeDust was enabled later (or group was created before we stored baselines),
                 # set a baseline FIRST and do not post historical trades on the first run.
