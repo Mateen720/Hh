@@ -2259,12 +2259,42 @@ def tonapi_account_events_subject(address: str, limit: int = 30) -> List[Dict[st
     return _fetch_cache_set(ck, evs if isinstance(evs, list) else [])
 
 def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
-    """Best-effort extraction of a real tx hash from a TonAPI event."""
+    """Best-effort extraction of a *real* transaction hash from a TonAPI event.
+
+    Important: TonAPI event_id is not a Ton blockchain tx hash.
+    Returning event_id here makes the bot attach the wrong Tx link.
+    """
     if not isinstance(ev, dict):
         return ""
-    eid = str(ev.get("event_id") or ev.get("id") or "").strip()
-    if eid:
-        return eid
+
+    def _maybe_hash(v: Any) -> str:
+        s = str(v or "").strip()
+        if not s:
+            return ""
+        if re.fullmatch(r"[0-9a-fA-F]{64}", s):
+            return s
+        try:
+            pad = "=" * ((4 - (len(s) % 4)) % 4)
+            raw = base64.urlsafe_b64decode(s + pad)
+            if isinstance(raw, (bytes, bytearray)) and len(raw) == 32:
+                return s
+        except Exception:
+            pass
+        return ""
+
+    # Top-level real tx hash fields first.
+    for k in ("hash", "tx_hash", "transaction_hash"):
+        hv = _maybe_hash(ev.get(k))
+        if hv:
+            return hv
+
+    tid0 = ev.get("transaction_id") or ev.get("transactionId") or {}
+    if isinstance(tid0, dict):
+        for k in ("hash", "tx_hash", "id"):
+            hv = _maybe_hash(tid0.get(k))
+            if hv:
+                return hv
+
     for act in (ev.get("actions") or []):
         if not isinstance(act, dict):
             continue
@@ -2278,14 +2308,14 @@ def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
                 continue
             tid = t.get("transaction_id") or t.get("transactionId") or {}
             if isinstance(tid, dict):
-                h = tid.get("hash") or tid.get("tx_hash") or tid.get("id")
-                h = str(h or "").strip()
-                if h:
-                    return h
-            h2 = t.get("hash") or t.get("tx_hash") or t.get("id")
-            h2 = str(h2 or "").strip()
-            if h2:
-                return h2
+                for k in ("hash", "tx_hash", "id"):
+                    hv = _maybe_hash(tid.get(k))
+                    if hv:
+                        return hv
+            for k in ("hash", "tx_hash", "id"):
+                hv = _maybe_hash(t.get(k))
+                if hv:
+                    return hv
     return ""
 
 def tonapi_find_tx_hash_by_lt(account: str, lt: str, limit: int = 40) -> str:
@@ -2799,9 +2829,14 @@ def _stonfi_extract_buys_from_actions(actions: Any, token_addr: str, tx_hash: st
         buyer = (aa.get("user") or aa.get("sender") or aa.get("initiator") or aa.get("from") or aa.get("trader") or "")
         if isinstance(buyer, dict):
             buyer = buyer.get("address") or ""
+        buyer = str(buyer or "").strip()
+        # Fast pool polling can contain router/noise actions; require a concrete buyer
+        # so we do not post a wrong buy from an ambiguous swap payload.
+        if not buyer:
+            continue
         out.append({
             "tx": tx_hash,
-            "buyer": str(buyer or "").strip(),
+            "buyer": buyer,
             "ton": ton_in,
             "token_amount": jet_out,
         })
@@ -5888,7 +5923,11 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     if resolved:
                         break
             tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
-    tx_url = f"https://tonviewer.com/transaction/{tx_hex}" if tx_hex else (f"https://tonviewer.com/transaction/{quote(str(tx))}" if tx else None)
+    tx_url = None
+    if tx_hex:
+        tx_url = f"https://tonviewer.com/transaction/{tx_hex}"
+    elif isinstance(tx, str) and tx.startswith(("https://tonviewer.com/transaction/", "https://tonviewer.com/tx/")):
+        tx_url = tx
     gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
     dex_url = f"https://dexscreener.com/ton/{pair_for_links}" if pair_for_links else None
 
