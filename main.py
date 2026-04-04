@@ -2205,12 +2205,15 @@ def tonapi_account_events_subject(address: str, limit: int = 30) -> List[Dict[st
     return ev if isinstance(ev, list) else []
 
 def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
-    """Best-effort extraction of a real tx hash from a TonAPI event."""
+    """Best-effort extraction of a *real* tx hash from a TonAPI event.
+
+    Important: TonAPI event_id is not always a transaction hash. Returning the
+    event id here causes wrong/missing Tonviewer Tx links and can also make
+    dedupe less reliable across feeds. Prefer base transaction hashes first and
+    only fall back to event_id when it itself decodes to a real 32-byte hash.
+    """
     if not isinstance(ev, dict):
         return ""
-    eid = str(ev.get("event_id") or ev.get("id") or "").strip()
-    if eid:
-        return eid
     for act in (ev.get("actions") or []):
         if not isinstance(act, dict):
             continue
@@ -2226,13 +2229,14 @@ def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
             if isinstance(tid, dict):
                 h = tid.get("hash") or tid.get("tx_hash") or tid.get("id")
                 h = str(h or "").strip()
-                if h:
+                if _normalize_tx_hash_to_hex(h):
                     return h
             h2 = t.get("hash") or t.get("tx_hash") or t.get("id")
             h2 = str(h2 or "").strip()
-            if h2:
+            if _normalize_tx_hash_to_hex(h2):
                 return h2
-    return ""
+    eid = str(ev.get("event_id") or ev.get("id") or "").strip()
+    return eid if _normalize_tx_hash_to_hex(eid) else ""
 
 def tonapi_find_tx_hash_by_lt(account: str, lt: str, limit: int = 40) -> str:
     """Find a real transaction hash for an account by LT (with cache + adaptive scan).
@@ -5599,7 +5603,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         refresh_remote_market = False
 
     if pool_for_market and refresh_remote_market:
-        pinfo = gecko_pool_info(pool_for_market)
+        pinfo = await _to_thread(gecko_pool_info, pool_for_market)
         if pinfo:
             pv = _to_float(pinfo.get("price_usd"))
             if pv is not None:
@@ -5617,7 +5621,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         # even when GeckoTerminal returns a blank market cap.
         if mc_usd is None or liq_usd is None or price_usd is None:
             try:
-                dpair = _dex_pair_lookup(pool_for_market)
+                dpair = await _to_thread(_dex_pair_lookup, pool_for_market)
             except Exception:
                 dpair = None
             if isinstance(dpair, dict):
@@ -5630,7 +5634,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     mc_usd = _to_float(dpair.get("marketCap") or dpair.get("market_cap") or dpair.get("fdv") or dpair.get("fdv_usd"))
 
     if (price_usd is None or mc_usd is None) and token.get("address") and refresh_remote_market:
-        tinfo = gecko_token_info(token["address"])
+        tinfo = await _to_thread(gecko_token_info, token["address"])
         if tinfo:
             if price_usd is None:
                 pv = _to_float(tinfo.get("price_usd"))
@@ -5665,7 +5669,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         # TonAPI Jetton info sometimes includes holders_count. If not, fall back
         # to the dedicated holders endpoint.
         try:
-            info = tonapi_jetton_info(jetton_addr)
+            info = await _to_thread(tonapi_jetton_info, jetton_addr)
             h = info.get("holders_count")
             if h is not None:
                 holders = int(h)
@@ -5673,7 +5677,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             pass
         if holders is None:
             try:
-                h2 = tonapi_jetton_holders_count(jetton_addr)
+                h2 = await _to_thread(tonapi_jetton_holders_count, jetton_addr)
                 if h2 is not None:
                     holders = int(h2)
             except Exception:
@@ -5697,7 +5701,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         total_supply = None
     if total_supply is None and jetton_addr and refresh_remote_market:
         try:
-            info = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton_addr}") or {}
+            info = await _to_thread(tonapi_get, f"{TONAPI_BASE}/v2/jettons/{jetton_addr}") or {}
             meta = info.get("metadata") or {}
             dec_raw = (meta.get("decimals") if isinstance(meta, dict) else None)
             if dec_raw is None:
@@ -5732,7 +5736,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         if TON_PRICE_CACHE.get("usd") is not None and _now - int(TON_PRICE_CACHE.get("ts") or 0) < 600:
             ton_usd = float(TON_PRICE_CACHE.get("usd"))
         elif not FAST_POST_MODE:
-            ton_usd = ton_usd_price()
+            ton_usd = await _to_thread(ton_usd_price)
     except Exception:
         ton_usd = None
     if ton_usd and ton_usd > 0:
@@ -5822,15 +5826,15 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     if not tx_hex and source == "DeDust":
         lt_guess = str(b.get("trade_id") or tx or "").strip()
         if lt_guess:
-            resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=300)
+            resolved = await _to_thread(tonapi_find_tx_hash_by_lt, str(dedust_pool or ""), lt_guess, 300)
             if not resolved:
                 # quick retries for busy pools
                 for _ in range(3):
                     try:
-                        time.sleep(0.35)
+                        await asyncio.sleep(0.35)
                     except Exception:
                         pass
-                    resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=600)
+                    resolved = await _to_thread(tonapi_find_tx_hash_by_lt, str(dedust_pool or ""), lt_guess, 600)
                     if resolved:
                         break
             tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
@@ -5842,7 +5846,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     change_pct = None
     try:
         if pair_for_links:
-            _p = _dex_pair_lookup(pair_for_links)
+            _p = await _to_thread(_dex_pair_lookup, pair_for_links)
             if isinstance(_p, dict):
                 _pc = _p.get("priceChange") or {}
                 _ch = None
