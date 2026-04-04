@@ -32,6 +32,14 @@ OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600")
 FAST_POST_MODE = str(os.getenv("FAST_POST_MODE", "1")).strip().lower() in ("1","true","yes","on")
 STARTUP_HISTORY_GRACE_SEC = max(0, int(float(os.getenv("STARTUP_HISTORY_GRACE_SEC", "120"))))
 PROCESS_START_TS = int(time.time())
+
+# Short-lived in-process fetch cache to stop duplicate remote calls when many chats
+# track the same pool/token. This reduces full poll-cycle time dramatically.
+FETCH_CACHE: Dict[str, Dict[str, Any]] = {}
+FETCH_CACHE_TTL = max(0.10, float(os.getenv("FETCH_CACHE_TTL", "0.90")))
+STON_LATEST_BLOCK_TTL = max(0.10, float(os.getenv("STON_LATEST_BLOCK_TTL", "0.50")))
+POLL_CONCURRENCY = max(4, int(os.getenv("POLL_CONCURRENCY", "24")))
+
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/KYRONTrending").strip()
 DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/KYRONEco").strip()
@@ -191,6 +199,13 @@ def ston_latest_block() -> Optional[int]:
       {"block": {"blockNumber": 123}}
     or other variants. We normalize safely.
     """
+    ck = "ston_latest_block"
+    cached = _fetch_cache_get(ck, STON_LATEST_BLOCK_TTL)
+    if cached is not None:
+        try:
+            return int(cached)
+        except Exception:
+            pass
     try:
         r = requests.get(STON_LATEST_BLOCK_URL, headers=STON_HEADERS, timeout=12)
         if r.status_code != 200:
@@ -201,7 +216,7 @@ def ston_latest_block() -> Optional[int]:
         if isinstance(js, dict) and isinstance(js.get("block"), dict):
             v = js["block"].get("blockNumber") or js["block"].get("block_number")
             try:
-                return int(v)
+                return _fetch_cache_set(ck, int(v))
             except Exception:
                 return None
 
@@ -209,14 +224,14 @@ def ston_latest_block() -> Optional[int]:
         if isinstance(js, dict):
             v = js.get("latestBlock") or js.get("latest_block") or js.get("block")
             try:
-                return int(v)
+                return _fetch_cache_set(ck, int(v))
             except Exception:
                 return None
 
         if isinstance(js, int):
-            return js
+            return _fetch_cache_set(ck, js)
         if isinstance(js, str) and js.isdigit():
-            return int(js)
+            return _fetch_cache_set(ck, int(js))
         return None
     except Exception:
         return None
@@ -2032,6 +2047,30 @@ def anti_spam_limit(level: str) -> Tuple[int,int]:
     return (8, BURST_WINDOW_SEC)
 
 # -------------------- TONAPI --------------------
+def _fetch_cache_get(key: str, ttl: float) -> Optional[Any]:
+    try:
+        ent = FETCH_CACHE.get(str(key))
+        if not isinstance(ent, dict):
+            return None
+        if (time.monotonic() - float(ent.get("ts") or 0.0)) > float(ttl):
+            return None
+        return ent.get("value")
+    except Exception:
+        return None
+
+def _fetch_cache_set(key: str, value: Any) -> Any:
+    try:
+        FETCH_CACHE[str(key)] = {"ts": time.monotonic(), "value": value}
+    except Exception:
+        pass
+    return value
+
+def _limit_to_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
 def tonapi_headers() -> Dict[str, str]:
     if not TONAPI_KEY:
         return {"Accept": "application/json"}
@@ -2185,24 +2224,39 @@ def tonapi_jetton_holder_addresses(jetton: str, limit: int = 8) -> List[str]:
     return out
 
 def tonapi_account_transactions(address: str, limit: int = 12) -> List[Dict[str, Any]]:
-    js = tonapi_get(f"{TONAPI_BASE}/v2/blockchain/accounts/{address}/transactions", params={"limit": limit})
+    lim = max(1, _limit_to_int(limit, 12))
+    ck = f"tonapi_txs:{_norm_addr(address)}:{lim}"
+    cached = _fetch_cache_get(ck, FETCH_CACHE_TTL)
+    if isinstance(cached, list):
+        return cached
+    js = tonapi_get(f"{TONAPI_BASE}/v2/blockchain/accounts/{address}/transactions", params={"limit": lim})
     txs = js.get("transactions") if isinstance(js, dict) else None
-    return txs if isinstance(txs, list) else []
+    return _fetch_cache_set(ck, txs if isinstance(txs, list) else [])
 
 def tonapi_account_events(address: str, limit: int = 10) -> List[Dict[str, Any]]:
-    js = tonapi_get(f"{TONAPI_BASE}/v2/accounts/{address}/events", params={"limit": limit})
-    ev = js.get("events") if isinstance(js, dict) else None
-    return ev if isinstance(ev, list) else []
+    lim = max(1, _limit_to_int(limit, 10))
+    ck = f"tonapi_events:{_norm_addr(address)}:{lim}"
+    cached = _fetch_cache_get(ck, FETCH_CACHE_TTL)
+    if isinstance(cached, list):
+        return cached
+    js = tonapi_get(f"{TONAPI_BASE}/v2/accounts/{address}/events", params={"limit": lim})
+    evs = js.get("events") if isinstance(js, dict) else None
+    return _fetch_cache_set(ck, evs if isinstance(evs, list) else [])
 
 
 def tonapi_account_events_subject(address: str, limit: int = 30) -> List[Dict[str, Any]]:
     """TonAPI account events with subject_only=true (less noise, better for DEX pool monitoring)."""
+    lim = max(1, _limit_to_int(limit, 30))
+    ck = f"tonapi_events_subject:{_norm_addr(address)}:{lim}"
+    cached = _fetch_cache_get(ck, FETCH_CACHE_TTL)
+    if isinstance(cached, list):
+        return cached
     js = tonapi_get(
         f"{TONAPI_BASE}/v2/accounts/{address}/events",
-        params={"limit": limit, "subject_only": "true"},
+        params={"limit": lim, "subject_only": "true"},
     )
-    ev = js.get("events") if isinstance(js, dict) else None
-    return ev if isinstance(ev, list) else []
+    evs = js.get("events") if isinstance(js, dict) else None
+    return _fetch_cache_set(ck, evs if isinstance(evs, list) else [])
 
 def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
     """Best-effort extraction of a real tx hash from a TonAPI event."""
@@ -2760,131 +2814,6 @@ def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> L
 def stonfi_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
     """Strict STON buy parser from TonAPI account events for fast pool monitoring."""
     return _stonfi_extract_buys_from_actions((ev or {}).get("actions"), token_addr, tonapi_event_tx_hash(ev))
-
-def dedust_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
-    """Strict DeDust buy parser from TonAPI blockchain transaction actions.
-
-    BUY = TON/pTON -> configured jetton.
-    If any action in the tx clearly shows configured jetton -> TON/pTON,
-    the whole tx is treated as a sell and returns no buys.
-    """
-    actions = (tx or {}).get("actions")
-    out: List[Dict[str, Any]] = []
-    if not isinstance(actions, list):
-        return out
-
-    def _asset_addr(x: Any) -> str:
-        if isinstance(x, dict):
-            return str(x.get("address") or x.get("master") or x.get("jetton_master") or x.get("jettonMaster") or "").strip()
-        return ""
-
-    def _is_ton_asset(x: Any) -> bool:
-        if not isinstance(x, dict):
-            return False
-        t = str(x.get("type") or x.get("kind") or x.get("asset_type") or "").strip().lower()
-        if t in ("ton", "native", "native_ton"):
-            return True
-        sym = str(x.get("symbol") or x.get("ticker") or x.get("name") or "").strip().lower()
-        if sym in ("ton", "wton", "pton"):
-            return True
-        if _asset_addr(x):
-            return False
-        native = x.get("is_ton") or x.get("isTon") or x.get("native")
-        return native is True
-
-    def _parse_amount(raw: Any, asset: Any) -> Optional[float]:
-        if raw is None:
-            return None
-        if isinstance(raw, (int, float)):
-            val = float(raw)
-        else:
-            s = str(raw).strip()
-            if not s:
-                return None
-            if s.replace("-", "").isdigit():
-                try:
-                    val = float(int(s))
-                except Exception:
-                    val = _to_float(s)
-            else:
-                val = _to_float(s)
-        dec = None
-        if isinstance(asset, dict):
-            d = asset.get("decimals")
-            if isinstance(d, int):
-                dec = d
-            else:
-                try:
-                    dec = int(d)
-                except Exception:
-                    dec = None
-        if dec is not None:
-            raw_s = str(raw).strip() if raw is not None else ""
-            if raw_s and raw_s.replace("-", "").isdigit() and abs(val) >= 10 ** (dec + 2):
-                val = val / (10 ** dec)
-        return val
-
-    token_addr_s = str(token_addr or "").strip()
-    tx_hash = _tx_hash(tx)
-
-    def _iter_actions():
-        for a in actions:
-            if not isinstance(a, dict):
-                continue
-            payload = a.get(a.get('type') or a.get('action') or a.get('name'))
-            aa = dict(a)
-            if isinstance(payload, dict):
-                aa.update(payload)
-            at = _action_type(aa).lower()
-            if "swap" not in at and "dex" not in at:
-                continue
-            dex = aa.get("dex")
-            dex_name = ""
-            if isinstance(dex, dict):
-                dex_name = str(dex.get("name") or dex.get("title") or dex.get("id") or "").lower()
-            if dex_name and ("dedust" not in dex_name and "de dust" not in dex_name):
-                continue
-            yield aa
-
-    for aa in _iter_actions():
-        in_asset = aa.get("asset_in") or aa.get("assetIn") or aa.get("in") or {}
-        out_asset = aa.get("asset_out") or aa.get("assetOut") or aa.get("out") or {}
-        in_addr = _asset_addr(in_asset)
-        in_is_token = bool(token_addr_s and in_addr == token_addr_s)
-        out_is_ton = _is_ton_asset(out_asset)
-        if in_is_token and out_is_ton:
-            return []
-
-    for aa in _iter_actions():
-        in_asset = aa.get("asset_in") or aa.get("assetIn") or aa.get("in") or {}
-        out_asset = aa.get("asset_out") or aa.get("assetOut") or aa.get("out") or {}
-        in_addr = _asset_addr(in_asset)
-        out_addr = _asset_addr(out_asset)
-        amt_in = _parse_amount(aa.get("amount_in") or aa.get("amountIn") or aa.get("in_amount"), in_asset)
-        amt_out = _parse_amount(aa.get("amount_out") or aa.get("amountOut") or aa.get("out_amount"), out_asset)
-
-        in_is_token = bool(token_addr_s and in_addr == token_addr_s)
-        out_is_token = bool(token_addr_s and out_addr == token_addr_s)
-        in_is_ton = _is_ton_asset(in_asset)
-        out_is_ton = _is_ton_asset(out_asset)
-        if in_is_token and out_is_ton:
-            continue
-        if not (in_is_ton and out_is_token):
-            continue
-        ton_in = amt_in
-        jet_out = amt_out
-        if not ton_in or not jet_out:
-            continue
-        buyer = (aa.get("user") or aa.get("sender") or aa.get("initiator") or aa.get("from") or aa.get("trader") or "")
-        if isinstance(buyer, dict):
-            buyer = buyer.get("address") or ""
-        out.append({
-            "tx": tx_hash,
-            "buyer": str(buyer or "").strip(),
-            "ton": ton_in,
-            "token_amount": jet_out,
-        })
-    return out
 
 def dedust_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
     """TonAPI events endpoint sometimes provides swap action info too."""
@@ -5140,52 +5069,7 @@ async def _poll_chat_once(app: Application, chat_id: int, g: Dict[str, Any]):
             posted_any = False
             ignore_before = effective_ignore_before_ts(token)
 
-            # Fastest path first: raw TonAPI blockchain transactions for the pool.
-            # These usually appear before /events and /trades, so post from here first.
-            try:
-                txs_fast = await _to_thread(tonapi_account_transactions, pool, 40)
-                if isinstance(txs_fast, list) and txs_fast:
-                    last_tx_seen = str(token.get("last_dedust_tx") or "").strip()
-                    new_txs = []
-                    for txo in txs_fast:
-                        if not isinstance(txo, dict):
-                            continue
-                        txh = str(_tx_hash(txo) or "").strip()
-                        if last_tx_seen and txh == last_tx_seen:
-                            break
-                        ut = int(txo.get("utime") or txo.get("now") or txo.get("timestamp") or 0)
-                        if ignore_before and ut and ut < ignore_before:
-                            continue
-                        if is_stale_buy_ts(ut):
-                            continue
-                        new_txs.append(txo)
-                    for txo in reversed(new_txs):
-                        for b in dedust_extract_buys_from_tonapi_tx(txo, token["address"]):
-                            ton_amt = float(b.get("ton") or 0.0)
-                            if ton_amt < min_buy:
-                                continue
-                            txh = str(b.get("tx") or _tx_hash(txo) or "").strip()
-                            dedupe_key = ('tx:' + _normalize_tx_hash_to_hex(txh)) if txh else ('dedust-tx:' + str(pool) + ':' + str(txo.get('lt') or ''))
-                            if not dedupe_ok(chat_id, dedupe_key):
-                                continue
-                            if settings.get('burst_mode', True) and burst['count'] >= max_msgs:
-                                continue
-                            burst['count'] += 1
-                            await post_buy(app, chat_id, token, {
-                                'tx': txh,
-                                'buyer': b.get('buyer'),
-                                'ton': ton_amt,
-                                'token_amount': float(b.get('token_amount') or 0.0),
-                            }, source='DeDust v2')
-                            posted_any = True
-                    newest_tx0 = txs_fast[0]
-                    newest_txh0 = str(_tx_hash(newest_tx0) or '').strip()
-                    if newest_txh0:
-                        token['last_dedust_tx'] = newest_txh0
-            except Exception as _e:
-                log.debug('DeDust TonAPI tx fast path err chat=%s %s', chat_id, _e)
-
-            # Fast path: TonAPI subject-only events are usually available earlier
+            # Fast path first: TonAPI subject-only events are usually available earlier
             # than DeDust /trades. This lets the bot post closer to the actual tx time.
             try:
                 events_fast = await _to_thread(tonapi_account_events_subject, pool, 60)
@@ -5697,7 +5581,7 @@ async def poll_once(app: Application):
         except Exception:
             pass
 
-    sem = asyncio.Semaphore(max(2, int(os.getenv("POLL_CONCURRENCY", "8"))))
+    sem = asyncio.Semaphore(POLL_CONCURRENCY)
 
     async def _runner(chat_id: int, g: Dict[str, Any]):
         async with sem:
@@ -5762,9 +5646,10 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     except Exception:
         refresh_remote_market = True
 
-    # Fast-post mode: never block the initial alert on remote market refresh.
-    # Reuse cached token/MARKET_CACHE values only in the hot path.
-    if FAST_POST_MODE:
+    # Fast-post mode: do not block the alert on remote market refresh when we
+    # already have cached stats. This is the main reason messages can arrive
+    # tens of seconds late even though the tx is already detected.
+    if FAST_POST_MODE and (price_usd is not None or liq_usd is not None or mc_usd is not None):
         refresh_remote_market = False
 
     if pool_for_market and refresh_remote_market:
@@ -5827,7 +5712,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     except Exception:
         refresh_holders = True
 
-    if FAST_POST_MODE:
+    if FAST_POST_MODE and holders is not None:
         refresh_holders = False
 
     if jetton_addr and refresh_holders:
@@ -5987,11 +5872,11 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     # Links row
     pair_for_links = pool_for_market or ""
     tx_hex = _normalize_tx_hash_to_hex(tx)
-    # DeDust sometimes returns only LT (no hash). Resolving it via extra TonAPI scans
-    # can add seconds of delay, so skip that in FAST_POST_MODE.
-    if (not tx_hex) and source.startswith("DeDust") and (not FAST_POST_MODE):
+    # DeDust sometimes returns only LT (no hash). Resolving the hash can be slow on hot pools,
+    # so in fast-post mode we skip the retry loop and send immediately.
+    if not tx_hex and source == "DeDust":
         lt_guess = str(b.get("trade_id") or tx or "").strip()
-        if lt_guess:
+        if lt_guess and (not FAST_POST_MODE):
             resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=300)
             if not resolved:
                 for _ in range(3):
