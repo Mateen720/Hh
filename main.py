@@ -32,14 +32,6 @@ OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600")
 FAST_POST_MODE = str(os.getenv("FAST_POST_MODE", "1")).strip().lower() in ("1","true","yes","on")
 STARTUP_HISTORY_GRACE_SEC = max(0, int(float(os.getenv("STARTUP_HISTORY_GRACE_SEC", "120"))))
 PROCESS_START_TS = int(time.time())
-
-# Short-lived in-process fetch cache to stop duplicate remote calls when many chats
-# track the same pool/token. This reduces full poll-cycle time dramatically.
-FETCH_CACHE: Dict[str, Dict[str, Any]] = {}
-FETCH_CACHE_TTL = max(0.10, float(os.getenv("FETCH_CACHE_TTL", "0.90")))
-STON_LATEST_BLOCK_TTL = max(0.10, float(os.getenv("STON_LATEST_BLOCK_TTL", "0.50")))
-POLL_CONCURRENCY = max(4, int(os.getenv("POLL_CONCURRENCY", "24")))
-
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/KYRONTrending").strip()
 DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/KYRONEco").strip()
@@ -199,13 +191,6 @@ def ston_latest_block() -> Optional[int]:
       {"block": {"blockNumber": 123}}
     or other variants. We normalize safely.
     """
-    ck = "ston_latest_block"
-    cached = _fetch_cache_get(ck, STON_LATEST_BLOCK_TTL)
-    if cached is not None:
-        try:
-            return int(cached)
-        except Exception:
-            pass
     try:
         r = requests.get(STON_LATEST_BLOCK_URL, headers=STON_HEADERS, timeout=12)
         if r.status_code != 200:
@@ -216,7 +201,7 @@ def ston_latest_block() -> Optional[int]:
         if isinstance(js, dict) and isinstance(js.get("block"), dict):
             v = js["block"].get("blockNumber") or js["block"].get("block_number")
             try:
-                return _fetch_cache_set(ck, int(v))
+                return int(v)
             except Exception:
                 return None
 
@@ -224,14 +209,14 @@ def ston_latest_block() -> Optional[int]:
         if isinstance(js, dict):
             v = js.get("latestBlock") or js.get("latest_block") or js.get("block")
             try:
-                return _fetch_cache_set(ck, int(v))
+                return int(v)
             except Exception:
                 return None
 
         if isinstance(js, int):
-            return _fetch_cache_set(ck, js)
+            return js
         if isinstance(js, str) and js.isdigit():
-            return _fetch_cache_set(ck, int(js))
+            return int(js)
         return None
     except Exception:
         return None
@@ -2047,30 +2032,6 @@ def anti_spam_limit(level: str) -> Tuple[int,int]:
     return (8, BURST_WINDOW_SEC)
 
 # -------------------- TONAPI --------------------
-def _fetch_cache_get(key: str, ttl: float) -> Optional[Any]:
-    try:
-        ent = FETCH_CACHE.get(str(key))
-        if not isinstance(ent, dict):
-            return None
-        if (time.monotonic() - float(ent.get("ts") or 0.0)) > float(ttl):
-            return None
-        return ent.get("value")
-    except Exception:
-        return None
-
-def _fetch_cache_set(key: str, value: Any) -> Any:
-    try:
-        FETCH_CACHE[str(key)] = {"ts": time.monotonic(), "value": value}
-    except Exception:
-        pass
-    return value
-
-def _limit_to_int(v: Any, default: int = 0) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return int(default)
-
 def tonapi_headers() -> Dict[str, str]:
     if not TONAPI_KEY:
         return {"Accept": "application/json"}
@@ -2224,77 +2185,32 @@ def tonapi_jetton_holder_addresses(jetton: str, limit: int = 8) -> List[str]:
     return out
 
 def tonapi_account_transactions(address: str, limit: int = 12) -> List[Dict[str, Any]]:
-    lim = max(1, _limit_to_int(limit, 12))
-    ck = f"tonapi_txs:{_norm_addr(address)}:{lim}"
-    cached = _fetch_cache_get(ck, FETCH_CACHE_TTL)
-    if isinstance(cached, list):
-        return cached
-    js = tonapi_get(f"{TONAPI_BASE}/v2/blockchain/accounts/{address}/transactions", params={"limit": lim})
+    js = tonapi_get(f"{TONAPI_BASE}/v2/blockchain/accounts/{address}/transactions", params={"limit": limit})
     txs = js.get("transactions") if isinstance(js, dict) else None
-    return _fetch_cache_set(ck, txs if isinstance(txs, list) else [])
+    return txs if isinstance(txs, list) else []
 
 def tonapi_account_events(address: str, limit: int = 10) -> List[Dict[str, Any]]:
-    lim = max(1, _limit_to_int(limit, 10))
-    ck = f"tonapi_events:{_norm_addr(address)}:{lim}"
-    cached = _fetch_cache_get(ck, FETCH_CACHE_TTL)
-    if isinstance(cached, list):
-        return cached
-    js = tonapi_get(f"{TONAPI_BASE}/v2/accounts/{address}/events", params={"limit": lim})
-    evs = js.get("events") if isinstance(js, dict) else None
-    return _fetch_cache_set(ck, evs if isinstance(evs, list) else [])
+    js = tonapi_get(f"{TONAPI_BASE}/v2/accounts/{address}/events", params={"limit": limit})
+    ev = js.get("events") if isinstance(js, dict) else None
+    return ev if isinstance(ev, list) else []
 
 
 def tonapi_account_events_subject(address: str, limit: int = 30) -> List[Dict[str, Any]]:
     """TonAPI account events with subject_only=true (less noise, better for DEX pool monitoring)."""
-    lim = max(1, _limit_to_int(limit, 30))
-    ck = f"tonapi_events_subject:{_norm_addr(address)}:{lim}"
-    cached = _fetch_cache_get(ck, FETCH_CACHE_TTL)
-    if isinstance(cached, list):
-        return cached
     js = tonapi_get(
         f"{TONAPI_BASE}/v2/accounts/{address}/events",
-        params={"limit": lim, "subject_only": "true"},
+        params={"limit": limit, "subject_only": "true"},
     )
-    evs = js.get("events") if isinstance(js, dict) else None
-    return _fetch_cache_set(ck, evs if isinstance(evs, list) else [])
+    ev = js.get("events") if isinstance(js, dict) else None
+    return ev if isinstance(ev, list) else []
 
 def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
-    """Best-effort extraction of a *real* transaction hash from a TonAPI event.
-
-    Important: TonAPI event_id is not a Ton blockchain tx hash.
-    Returning event_id here makes the bot attach the wrong Tx link.
-    """
+    """Best-effort extraction of a real tx hash from a TonAPI event."""
     if not isinstance(ev, dict):
         return ""
-
-    def _maybe_hash(v: Any) -> str:
-        s = str(v or "").strip()
-        if not s:
-            return ""
-        if re.fullmatch(r"[0-9a-fA-F]{64}", s):
-            return s
-        try:
-            pad = "=" * ((4 - (len(s) % 4)) % 4)
-            raw = base64.urlsafe_b64decode(s + pad)
-            if isinstance(raw, (bytes, bytearray)) and len(raw) == 32:
-                return s
-        except Exception:
-            pass
-        return ""
-
-    # Top-level real tx hash fields first.
-    for k in ("hash", "tx_hash", "transaction_hash"):
-        hv = _maybe_hash(ev.get(k))
-        if hv:
-            return hv
-
-    tid0 = ev.get("transaction_id") or ev.get("transactionId") or {}
-    if isinstance(tid0, dict):
-        for k in ("hash", "tx_hash", "id"):
-            hv = _maybe_hash(tid0.get(k))
-            if hv:
-                return hv
-
+    eid = str(ev.get("event_id") or ev.get("id") or "").strip()
+    if eid:
+        return eid
     for act in (ev.get("actions") or []):
         if not isinstance(act, dict):
             continue
@@ -2308,14 +2224,14 @@ def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
                 continue
             tid = t.get("transaction_id") or t.get("transactionId") or {}
             if isinstance(tid, dict):
-                for k in ("hash", "tx_hash", "id"):
-                    hv = _maybe_hash(tid.get(k))
-                    if hv:
-                        return hv
-            for k in ("hash", "tx_hash", "id"):
-                hv = _maybe_hash(t.get(k))
-                if hv:
-                    return hv
+                h = tid.get("hash") or tid.get("tx_hash") or tid.get("id")
+                h = str(h or "").strip()
+                if h:
+                    return h
+            h2 = t.get("hash") or t.get("tx_hash") or t.get("id")
+            h2 = str(h2 or "").strip()
+            if h2:
+                return h2
     return ""
 
 def tonapi_find_tx_hash_by_lt(account: str, lt: str, limit: int = 40) -> str:
@@ -2829,14 +2745,9 @@ def _stonfi_extract_buys_from_actions(actions: Any, token_addr: str, tx_hash: st
         buyer = (aa.get("user") or aa.get("sender") or aa.get("initiator") or aa.get("from") or aa.get("trader") or "")
         if isinstance(buyer, dict):
             buyer = buyer.get("address") or ""
-        buyer = str(buyer or "").strip()
-        # Fast pool polling can contain router/noise actions; require a concrete buyer
-        # so we do not post a wrong buy from an ambiguous swap payload.
-        if not buyer:
-            continue
         out.append({
             "tx": tx_hash,
-            "buyer": buyer,
+            "buyer": str(buyer or "").strip(),
             "ton": ton_in,
             "token_amount": jet_out,
         })
@@ -5616,7 +5527,7 @@ async def poll_once(app: Application):
         except Exception:
             pass
 
-    sem = asyncio.Semaphore(POLL_CONCURRENCY)
+    sem = asyncio.Semaphore(max(2, int(os.getenv("POLL_CONCURRENCY", "8"))))
 
     async def _runner(chat_id: int, g: Dict[str, Any]):
         async with sem:
@@ -5907,13 +5818,13 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     # Links row
     pair_for_links = pool_for_market or ""
     tx_hex = _normalize_tx_hash_to_hex(tx)
-    # DeDust sometimes returns only LT (no hash). Resolving the hash can be slow on hot pools,
-    # so in fast-post mode we skip the retry loop and send immediately.
+    # DeDust sometimes returns only LT (no hash). Resolve hash via TonAPI if possible.
     if not tx_hex and source == "DeDust":
         lt_guess = str(b.get("trade_id") or tx or "").strip()
-        if lt_guess and (not FAST_POST_MODE):
+        if lt_guess:
             resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=300)
             if not resolved:
+                # quick retries for busy pools
                 for _ in range(3):
                     try:
                         time.sleep(0.35)
@@ -5923,11 +5834,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     if resolved:
                         break
             tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
-    tx_url = None
-    if tx_hex:
-        tx_url = f"https://tonviewer.com/transaction/{tx_hex}"
-    elif isinstance(tx, str) and tx.startswith(("https://tonviewer.com/transaction/", "https://tonviewer.com/tx/")):
-        tx_url = tx
+    tx_url = f"https://tonviewer.com/transaction/{tx_hex}" if tx_hex else (f"https://tonviewer.com/transaction/{quote(str(tx))}" if tx else None)
     gt_url = gecko_terminal_pool_url(pair_for_links) if pair_for_links else None
     dex_url = f"https://dexscreener.com/ton/{pair_for_links}" if pair_for_links else None
 
@@ -5999,11 +5906,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     # USD display (best-effort)
     usd_spent = None
     try:
-        p = None
-        if TON_PRICE_CACHE.get("usd") is not None and _now - int(TON_PRICE_CACHE.get("ts") or 0) < 600:
-            p = float(TON_PRICE_CACHE.get("usd"))
-        elif not FAST_POST_MODE:
-            p = ton_usd_price()
+        p = ton_usd_price()
         if p and p > 0:
             usd_spent = ton_amt * float(p)
     except Exception:
