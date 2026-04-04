@@ -2761,6 +2761,131 @@ def stonfi_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -
     """Strict STON buy parser from TonAPI account events for fast pool monitoring."""
     return _stonfi_extract_buys_from_actions((ev or {}).get("actions"), token_addr, tonapi_event_tx_hash(ev))
 
+def dedust_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
+    """Strict DeDust buy parser from TonAPI blockchain transaction actions.
+
+    BUY = TON/pTON -> configured jetton.
+    If any action in the tx clearly shows configured jetton -> TON/pTON,
+    the whole tx is treated as a sell and returns no buys.
+    """
+    actions = (tx or {}).get("actions")
+    out: List[Dict[str, Any]] = []
+    if not isinstance(actions, list):
+        return out
+
+    def _asset_addr(x: Any) -> str:
+        if isinstance(x, dict):
+            return str(x.get("address") or x.get("master") or x.get("jetton_master") or x.get("jettonMaster") or "").strip()
+        return ""
+
+    def _is_ton_asset(x: Any) -> bool:
+        if not isinstance(x, dict):
+            return False
+        t = str(x.get("type") or x.get("kind") or x.get("asset_type") or "").strip().lower()
+        if t in ("ton", "native", "native_ton"):
+            return True
+        sym = str(x.get("symbol") or x.get("ticker") or x.get("name") or "").strip().lower()
+        if sym in ("ton", "wton", "pton"):
+            return True
+        if _asset_addr(x):
+            return False
+        native = x.get("is_ton") or x.get("isTon") or x.get("native")
+        return native is True
+
+    def _parse_amount(raw: Any, asset: Any) -> Optional[float]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            val = float(raw)
+        else:
+            s = str(raw).strip()
+            if not s:
+                return None
+            if s.replace("-", "").isdigit():
+                try:
+                    val = float(int(s))
+                except Exception:
+                    val = _to_float(s)
+            else:
+                val = _to_float(s)
+        dec = None
+        if isinstance(asset, dict):
+            d = asset.get("decimals")
+            if isinstance(d, int):
+                dec = d
+            else:
+                try:
+                    dec = int(d)
+                except Exception:
+                    dec = None
+        if dec is not None:
+            raw_s = str(raw).strip() if raw is not None else ""
+            if raw_s and raw_s.replace("-", "").isdigit() and abs(val) >= 10 ** (dec + 2):
+                val = val / (10 ** dec)
+        return val
+
+    token_addr_s = str(token_addr or "").strip()
+    tx_hash = _tx_hash(tx)
+
+    def _iter_actions():
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            payload = a.get(a.get('type') or a.get('action') or a.get('name'))
+            aa = dict(a)
+            if isinstance(payload, dict):
+                aa.update(payload)
+            at = _action_type(aa).lower()
+            if "swap" not in at and "dex" not in at:
+                continue
+            dex = aa.get("dex")
+            dex_name = ""
+            if isinstance(dex, dict):
+                dex_name = str(dex.get("name") or dex.get("title") or dex.get("id") or "").lower()
+            if dex_name and ("dedust" not in dex_name and "de dust" not in dex_name):
+                continue
+            yield aa
+
+    for aa in _iter_actions():
+        in_asset = aa.get("asset_in") or aa.get("assetIn") or aa.get("in") or {}
+        out_asset = aa.get("asset_out") or aa.get("assetOut") or aa.get("out") or {}
+        in_addr = _asset_addr(in_asset)
+        in_is_token = bool(token_addr_s and in_addr == token_addr_s)
+        out_is_ton = _is_ton_asset(out_asset)
+        if in_is_token and out_is_ton:
+            return []
+
+    for aa in _iter_actions():
+        in_asset = aa.get("asset_in") or aa.get("assetIn") or aa.get("in") or {}
+        out_asset = aa.get("asset_out") or aa.get("assetOut") or aa.get("out") or {}
+        in_addr = _asset_addr(in_asset)
+        out_addr = _asset_addr(out_asset)
+        amt_in = _parse_amount(aa.get("amount_in") or aa.get("amountIn") or aa.get("in_amount"), in_asset)
+        amt_out = _parse_amount(aa.get("amount_out") or aa.get("amountOut") or aa.get("out_amount"), out_asset)
+
+        in_is_token = bool(token_addr_s and in_addr == token_addr_s)
+        out_is_token = bool(token_addr_s and out_addr == token_addr_s)
+        in_is_ton = _is_ton_asset(in_asset)
+        out_is_ton = _is_ton_asset(out_asset)
+        if in_is_token and out_is_ton:
+            continue
+        if not (in_is_ton and out_is_token):
+            continue
+        ton_in = amt_in
+        jet_out = amt_out
+        if not ton_in or not jet_out:
+            continue
+        buyer = (aa.get("user") or aa.get("sender") or aa.get("initiator") or aa.get("from") or aa.get("trader") or "")
+        if isinstance(buyer, dict):
+            buyer = buyer.get("address") or ""
+        out.append({
+            "tx": tx_hash,
+            "buyer": str(buyer or "").strip(),
+            "ton": ton_in,
+            "token_amount": jet_out,
+        })
+    return out
+
 def dedust_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
     """TonAPI events endpoint sometimes provides swap action info too."""
     out: List[Dict[str, Any]] = []
@@ -5015,7 +5140,52 @@ async def _poll_chat_once(app: Application, chat_id: int, g: Dict[str, Any]):
             posted_any = False
             ignore_before = effective_ignore_before_ts(token)
 
-            # Fast path first: TonAPI subject-only events are usually available earlier
+            # Fastest path first: raw TonAPI blockchain transactions for the pool.
+            # These usually appear before /events and /trades, so post from here first.
+            try:
+                txs_fast = await _to_thread(tonapi_account_transactions, pool, 40)
+                if isinstance(txs_fast, list) and txs_fast:
+                    last_tx_seen = str(token.get("last_dedust_tx") or "").strip()
+                    new_txs = []
+                    for txo in txs_fast:
+                        if not isinstance(txo, dict):
+                            continue
+                        txh = str(_tx_hash(txo) or "").strip()
+                        if last_tx_seen and txh == last_tx_seen:
+                            break
+                        ut = int(txo.get("utime") or txo.get("now") or txo.get("timestamp") or 0)
+                        if ignore_before and ut and ut < ignore_before:
+                            continue
+                        if is_stale_buy_ts(ut):
+                            continue
+                        new_txs.append(txo)
+                    for txo in reversed(new_txs):
+                        for b in dedust_extract_buys_from_tonapi_tx(txo, token["address"]):
+                            ton_amt = float(b.get("ton") or 0.0)
+                            if ton_amt < min_buy:
+                                continue
+                            txh = str(b.get("tx") or _tx_hash(txo) or "").strip()
+                            dedupe_key = ('tx:' + _normalize_tx_hash_to_hex(txh)) if txh else ('dedust-tx:' + str(pool) + ':' + str(txo.get('lt') or ''))
+                            if not dedupe_ok(chat_id, dedupe_key):
+                                continue
+                            if settings.get('burst_mode', True) and burst['count'] >= max_msgs:
+                                continue
+                            burst['count'] += 1
+                            await post_buy(app, chat_id, token, {
+                                'tx': txh,
+                                'buyer': b.get('buyer'),
+                                'ton': ton_amt,
+                                'token_amount': float(b.get('token_amount') or 0.0),
+                            }, source='DeDust v2')
+                            posted_any = True
+                    newest_tx0 = txs_fast[0]
+                    newest_txh0 = str(_tx_hash(newest_tx0) or '').strip()
+                    if newest_txh0:
+                        token['last_dedust_tx'] = newest_txh0
+            except Exception as _e:
+                log.debug('DeDust TonAPI tx fast path err chat=%s %s', chat_id, _e)
+
+            # Fast path: TonAPI subject-only events are usually available earlier
             # than DeDust /trades. This lets the bot post closer to the actual tx time.
             try:
                 events_fast = await _to_thread(tonapi_account_events_subject, pool, 60)
@@ -5592,10 +5762,9 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     except Exception:
         refresh_remote_market = True
 
-    # Fast-post mode: do not block the alert on remote market refresh when we
-    # already have cached stats. This is the main reason messages can arrive
-    # tens of seconds late even though the tx is already detected.
-    if FAST_POST_MODE and (price_usd is not None or liq_usd is not None or mc_usd is not None):
+    # Fast-post mode: never block the initial alert on remote market refresh.
+    # Reuse cached token/MARKET_CACHE values only in the hot path.
+    if FAST_POST_MODE:
         refresh_remote_market = False
 
     if pool_for_market and refresh_remote_market:
@@ -5658,7 +5827,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     except Exception:
         refresh_holders = True
 
-    if FAST_POST_MODE and holders is not None:
+    if FAST_POST_MODE:
         refresh_holders = False
 
     if jetton_addr and refresh_holders:
@@ -5818,13 +5987,13 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     # Links row
     pair_for_links = pool_for_market or ""
     tx_hex = _normalize_tx_hash_to_hex(tx)
-    # DeDust sometimes returns only LT (no hash). Resolve hash via TonAPI if possible.
-    if not tx_hex and source == "DeDust":
+    # DeDust sometimes returns only LT (no hash). Resolving it via extra TonAPI scans
+    # can add seconds of delay, so skip that in FAST_POST_MODE.
+    if (not tx_hex) and source.startswith("DeDust") and (not FAST_POST_MODE):
         lt_guess = str(b.get("trade_id") or tx or "").strip()
         if lt_guess:
             resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=300)
             if not resolved:
-                # quick retries for busy pools
                 for _ in range(3):
                     try:
                         time.sleep(0.35)
@@ -5906,7 +6075,11 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     # USD display (best-effort)
     usd_spent = None
     try:
-        p = ton_usd_price()
+        p = None
+        if TON_PRICE_CACHE.get("usd") is not None and _now - int(TON_PRICE_CACHE.get("ts") or 0) < 600:
+            p = float(TON_PRICE_CACHE.get("usd"))
+        elif not FAST_POST_MODE:
+            p = ton_usd_price()
         if p and p > 0:
             usd_spent = ton_amt * float(p)
     except Exception:
