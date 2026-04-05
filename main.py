@@ -1,5 +1,5 @@
 
-import os, json, time, asyncio, logging, re, html, base64
+import os, json, time, asyncio, logging, re, html, base64, threading
 from typing import Any, Dict, Optional, List, Tuple
 from urllib.parse import urlparse, quote
 import requests
@@ -24,9 +24,9 @@ log = logging.getLogger("spyton_public")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
-POLL_INTERVAL = max(0.05, float(os.getenv("POLL_INTERVAL", "0.08")))
-TONAPI_TIMEOUT = max(2.0, float(os.getenv("TONAPI_TIMEOUT", "4")))
-STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "1")).strip().lower() in ("1","true","yes","on")
+POLL_INTERVAL = max(0.25, float(os.getenv("POLL_INTERVAL", "1.5")))
+TONAPI_TIMEOUT = max(3.0, float(os.getenv("TONAPI_TIMEOUT", "10")))
+STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "0")).strip().lower() in ("1","true","yes","on")
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600"))))
 FAST_POST_MODE = str(os.getenv("FAST_POST_MODE", "1")).strip().lower() in ("1","true","yes","on")
@@ -82,6 +82,13 @@ BLUM_TX_LIMIT = max(20, int(float(os.getenv("BLUM_TX_LIMIT", "80"))))
 LAUNCHPAD_DISCOVERY_LIMIT = max(12, int(float(os.getenv("LAUNCHPAD_DISCOVERY_LIMIT", "24"))))
 LAUNCHPAD_DISCOVERY_HOLDER_LIMIT = max(6, int(float(os.getenv("LAUNCHPAD_DISCOVERY_HOLDER_LIMIT", "12"))))
 LAUNCHPAD_DISCOVERY_REFRESH_SEC = max(60, int(float(os.getenv("LAUNCHPAD_DISCOVERY_REFRESH_SEC", "600"))))
+TONAPI_MIN_REQUEST_INTERVAL = max(0.0, float(os.getenv("TONAPI_MIN_REQUEST_INTERVAL", "0.20")))
+TONAPI_RETRY_COUNT = max(1, int(float(os.getenv("TONAPI_RETRY_COUNT", "4"))))
+_TRACKER_LAST_POST_TS = 0
+_TRACKER_LAST_HEARTBEAT_TS = 0
+_TONAPI_REQ_LOCK = threading.Lock()
+_TONAPI_LAST_REQ_TS = 0.0
+
 
 
 def _load_addr_map_env(name: str) -> Dict[str, str]:
@@ -124,44 +131,13 @@ def ensure_ton_amount(v: float) -> float:
     return x
 
 
-def _canon_ton_addr(v: Any) -> str:
-    """Best-effort canonical TON address key.
-
-    Converts friendly/base64 addresses (EQ..., UQ..., kQ..., 0Q...) and raw
-    workchain:hash forms into a stable string like ``0:<64hex>`` or ``-1:<64hex>``.
-    Falls back to a trimmed lowercase string when parsing is not possible.
-    """
+def _norm_addr(v: Any) -> str:
     s = str(v or "").strip()
     if not s:
         return ""
-    # raw workchain:hash
-    m = re.fullmatch(r'(-?\d+):([0-9a-fA-F]{64})', s)
-    if m:
-        return f"{int(m.group(1))}:{m.group(2).lower()}"
-    # sometimes callers pass only the 256-bit body without workchain
-    if re.fullmatch(r'[0-9a-fA-F]{64}', s):
-        return f"0:{s.lower()}"
-    # friendly/base64url address with crc16 tail
-    try:
-        pad = '=' * ((4 - (len(s) % 4)) % 4)
-        raw = base64.urlsafe_b64decode(s + pad)
-        if len(raw) == 36:
-            wc = int.from_bytes(raw[1:2], 'big', signed=True)
-            h = raw[2:34].hex()
-            return f"{wc}:{h}"
-    except Exception:
-        pass
-    return s.lower()
-
-
-def _norm_addr(v: Any) -> str:
-    return _canon_ton_addr(v)
-
-
-def _addr_eq(a: Any, b: Any) -> bool:
-    aa = _canon_ton_addr(a)
-    bb = _canon_ton_addr(b)
-    return bool(aa and bb and aa == bb)
+    if s.startswith("0:"):
+        s = s[2:]
+    return s
 
 
 USER_PREFS_FILE = _data_path(os.getenv("USER_PREFS_FILE", "user_prefs_public.json"))
@@ -391,9 +367,9 @@ def ston_event_buy_for_token(ev: Dict[str, Any], token: Dict[str, Any]):
 
     token_leg = None
     if tok_addr:
-        if _addr_eq(leg0_addr, tok_addr):
+        if leg0_addr == tok_addr:
             token_leg = 0
-        elif _addr_eq(leg1_addr, tok_addr):
+        elif leg1_addr == tok_addr:
             token_leg = 1
     if token_leg is None and tok_sym:
         if leg0_sym == tok_sym and leg1_sym in {x.upper() for x in TON_LIKE_SYMS}:
@@ -656,7 +632,7 @@ def dedust_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str, pool_addr
 
         jetton = jt.get("jetton") or {}
         jetton_addr = str((jetton.get("address") if isinstance(jetton, dict) else "") or "").strip()
-        if not _addr_eq(jetton_addr, token_addr):
+        if jetton_addr != token_addr:
             continue
 
         recipient = jt.get("recipient") or {}
@@ -819,11 +795,11 @@ def blum_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -> 
             continue
         jetton = jt.get("jetton") or {}
         jetton_addr = _addr(jetton)
-        if not _addr_eq(jetton_addr, token_addr):
+        if jetton_addr != token_addr:
             continue
         recipient = _addr(jt.get("recipient"))
         sender = _addr(jt.get("sender"))
-        if not recipient or _addr_eq(recipient, token_addr) or recipient == sender:
+        if not recipient or recipient == token_addr or recipient == sender:
             continue
         dec = token_decimals
         try:
@@ -1159,7 +1135,7 @@ def infer_launchpad_routes_for_token(token_addr: str, seed_addresses: Optional[L
 
     def _add_watch(a: Any):
         aa = _norm_addr(a)
-        if aa and aa not in seen_watch and not _addr_eq(aa, token_addr):
+        if aa and aa not in seen_watch and aa != token_addr:
             seen_watch.add(aa)
             watch_addrs.append(aa)
 
@@ -2069,18 +2045,32 @@ def tonapi_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {TONAPI_KEY}", "Accept": "application/json"}
 
 def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
-    """HTTP GET helper for TonAPI with light retry/backoff.
+    """HTTP GET helper for TonAPI with throttling + retry/backoff.
 
-    Without a TONAPI key, TonAPI can rate-limit (429). We retry a few times and
-    fall back to the last known holders value in the caller if still unavailable.
+    The original build was extremely aggressive and could silently stop seeing
+    buys once TonAPI started rate-limiting. This helper serializes requests just
+    enough to keep the feed alive on Railway.
     """
+    global _TONAPI_LAST_REQ_TS
     headers = tonapi_headers()
-    # retry on 429 / transient 5xx
-    for attempt in range(3):
+    for attempt in range(TONAPI_RETRY_COUNT):
         try:
+            if TONAPI_MIN_REQUEST_INTERVAL > 0:
+                with _TONAPI_REQ_LOCK:
+                    now = time.monotonic()
+                    wait = TONAPI_MIN_REQUEST_INTERVAL - (now - _TONAPI_LAST_REQ_TS)
+                    if wait > 0:
+                        time.sleep(wait)
+                    _TONAPI_LAST_REQ_TS = time.monotonic()
             res = requests.get(url, headers=headers, params=params, timeout=TONAPI_TIMEOUT)
-            # If the user provided a key but used the wrong header scheme, try X-API-Key once.
             if res.status_code in (401, 403) and TONAPI_KEY:
+                if TONAPI_MIN_REQUEST_INTERVAL > 0:
+                    with _TONAPI_REQ_LOCK:
+                        now = time.monotonic()
+                        wait = TONAPI_MIN_REQUEST_INTERVAL - (now - _TONAPI_LAST_REQ_TS)
+                        if wait > 0:
+                            time.sleep(wait)
+                        _TONAPI_LAST_REQ_TS = time.monotonic()
                 res = requests.get(
                     url,
                     headers={"X-API-Key": TONAPI_KEY, "Accept": "application/json"},
@@ -2091,19 +2081,21 @@ def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optiona
             if res.status_code == 200:
                 return res.json()
 
-            # rate limit or temporary server issues: backoff and retry
             if res.status_code in (429, 500, 502, 503, 504):
                 try:
-                    time.sleep(0.20 * (2 ** attempt))
+                    time.sleep(min(2.5, 0.30 * (2 ** attempt)))
                 except Exception:
                     pass
                 continue
 
+            if attempt == 0:
+                log.warning("TonAPI non-200 %s for %s", res.status_code, url)
             return None
-        except Exception:
-            # transient network errors
+        except Exception as e:
+            if attempt == 0:
+                log.warning("TonAPI request failed for %s: %s", url, e)
             try:
-                time.sleep(0.12 * (2 ** attempt))
+                time.sleep(min(2.0, 0.20 * (2 ** attempt)))
             except Exception:
                 pass
             continue
@@ -2733,9 +2725,9 @@ def _stonfi_extract_buys_from_actions(actions: Any, token_addr: str, tx_hash: st
         out_asset = aa.get("asset_out") or aa.get("assetOut") or aa.get("out") or {}
         in_addr = _asset_addr(in_asset)
         out_addr = _asset_addr(out_asset)
-        in_is_token = bool(token_addr_s and _addr_eq(in_addr, token_addr_s))
+        in_is_token = bool(token_addr_s and in_addr == token_addr_s)
         out_is_ton = _is_ton_asset(out_asset)
-        if _addr_eq(in_addr, token_addr_s) and out_is_ton:
+        if in_is_token and out_is_ton:
             return []
 
     for a in actions:
@@ -2762,13 +2754,13 @@ def _stonfi_extract_buys_from_actions(actions: Any, token_addr: str, tx_hash: st
         amt_in = _parse_amount(aa.get("amount_in") or aa.get("amountIn") or aa.get("in_amount"), in_asset)
         amt_out = _parse_amount(aa.get("amount_out") or aa.get("amountOut") or aa.get("out_amount"), out_asset)
 
-        in_is_token = bool(token_addr_s and _addr_eq(in_addr, token_addr_s))
-        out_is_token = bool(token_addr_s and _addr_eq(out_addr, token_addr_s))
+        in_is_token = bool(token_addr_s and in_addr == token_addr_s)
+        out_is_token = bool(token_addr_s and out_addr == token_addr_s)
         in_is_ton = _is_ton_asset(in_asset)
         out_is_ton = _is_ton_asset(out_asset)
 
         # Never allow token->TON sells.
-        if _addr_eq(in_addr, token_addr_s) and out_is_ton:
+        if in_is_token and out_is_ton:
             continue
         # Only TON->token buys are allowed.
         if not (in_is_ton and out_is_token):
@@ -2862,9 +2854,9 @@ def dedust_extract_buys_from_tonapi_event(ev: Dict[str, Any], token_addr: str) -
         out_is_ton = _is_ton_asset(out_asset)
 
         # Hard reject token -> TON sells.
-        if _addr_eq(in_addr, token_addr) and out_is_ton:
+        if in_addr == token_addr and out_is_ton:
             continue
-        if not (in_is_ton and _addr_eq(out_addr, token_addr)):
+        if not (in_is_ton and out_addr == token_addr):
             continue
 
         ton_in = _parse_amount(amt_in_raw, in_asset)
@@ -4571,6 +4563,27 @@ async def configure_group_token(chat_id: int, jetton: str, context: ContextTypes
         return
     await _set_token_now(chat_id, jetton, context, reply_to_chat, telegram=telegram, dex_mode=dex_mode, announce=announce)
 
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    g = get_group(chat_id)
+    tok = g.get("token") if isinstance(g, dict) else None
+    if not isinstance(tok, dict):
+        await update.message.reply_text("No token configured for this chat yet.")
+        return
+    last_post_age = (int(time.time()) - int(_TRACKER_LAST_POST_TS)) if _TRACKER_LAST_POST_TS else -1
+    text = (
+        f"Status\n"
+        f"Token: {tok.get('symbol') or tok.get('name') or tok.get('address')}\n"
+        f"STON pool: {tok.get('ston_pool') or 'NONE'}\n"
+        f"DeDust pool: {tok.get('dedust_pool') or 'NONE'}\n"
+        f"Launchpad watch: {tok.get('launchpad_watch') or 'NONE'}\n"
+        f"Init done: {bool(tok.get('init_done'))}\n"
+        f"Paused: {bool(tok.get('paused'))}\n"
+        f"Last tracker post age: {last_post_age}s"
+    )
+    await update.message.reply_text(text)
+
 async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
@@ -4839,7 +4852,7 @@ async def _poll_chat_once(app: Application, chat_id: int, g: Dict[str, Any]):
             # Fast path first: recent pool transactions, then TonAPI /events.
             posted_any = False
             try:
-                txs_fast = await _to_thread(tonapi_account_transactions, pool, 40)
+                txs_fast = await _to_thread(tonapi_account_transactions, pool, 20)
                 if isinstance(txs_fast, list) and txs_fast:
                     last_tx_seen = str(token.get("last_ston_tx") or "").strip()
                     new_txs = []
@@ -4878,7 +4891,7 @@ async def _poll_chat_once(app: Application, chat_id: int, g: Dict[str, Any]):
             except Exception as _e:
                 log.debug('STON TonAPI tx fast path err chat=%s %s', chat_id, _e)
             try:
-                events = await _to_thread(tonapi_account_events_subject, pool, 50)
+                events = await _to_thread(tonapi_account_events_subject, pool, 20)
                 if isinstance(events, list) and events:
                     last_eid = str(token.get('last_ston_event_id') or '').strip()
                     try:
@@ -4966,7 +4979,7 @@ async def _poll_chat_once(app: Application, chat_id: int, g: Dict[str, Any]):
                 if is_stale_buy_ts(ev_ts):
                     continue
                 pair_id = str(ev.get("pairId") or "").strip()
-                if not _addr_eq(pair_id, pool) and str(pair_id).strip() != str(pool).strip():
+                if pair_id != pool:
                     continue
                 tx = str(ev.get("txnId") or "").strip()
                 if not tx:
@@ -5562,7 +5575,7 @@ async def poll_once(app: Application):
         except Exception:
             pass
 
-    sem = asyncio.Semaphore(max(2, int(os.getenv("POLL_CONCURRENCY", "8"))))
+    sem = asyncio.Semaphore(max(1, int(os.getenv("POLL_CONCURRENCY", "2"))))
 
     async def _runner(chat_id: int, g: Dict[str, Any]):
         async with sem:
@@ -5571,16 +5584,29 @@ async def poll_once(app: Application):
             except Exception as e:
                 log.debug("poll chat err chat=%s %s", chat_id, e)
 
+    global _TRACKER_LAST_HEARTBEAT_TS
+    now_ts = int(time.time())
+    if now_ts - int(_TRACKER_LAST_HEARTBEAT_TS or 0) >= 60:
+        _TRACKER_LAST_HEARTBEAT_TS = now_ts
+        try:
+            log.info("tracker heartbeat: groups=%s items=%s last_post_age=%ss", len(GROUPS or {}), len(items), (now_ts - int(_TRACKER_LAST_POST_TS or 0)) if _TRACKER_LAST_POST_TS else -1)
+        except Exception:
+            pass
+
     if items:
         await asyncio.gather(*[_runner(chat_id, g) for chat_id, g in items], return_exceptions=True)
+    elif now_ts - int(_TRACKER_LAST_HEARTBEAT_TS or 0) <= 1:
+        log.warning("tracker has no configured tokens/groups to poll")
 
 async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dict[str, Any], source: str):
     sym = (token.get("symbol") or "").strip()
     name = (token.get("name") or "").strip()
     title = sym or name or "TOKEN"
 
+    global _TRACKER_LAST_POST_TS
     ton_amt = float(b.get("ton") or 0.0)
     tok_amt = b.get("token_amount")
+    _TRACKER_LAST_POST_TS = int(time.time())
     tok_symbol = b.get("token_symbol") or sym or ""
 
     # Record for Top-10 leaderboard (rolling window)
@@ -6314,12 +6340,20 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
 
     try:
         await _send(chat_id)
+        try:
+            log.info("buy posted chat=%s token=%s source=%s ton=%.4f tx=%s", chat_id, token.get("symbol") or token.get("address"), source, ton_amt, tx[:24])
+        except Exception:
+            pass
     except Exception as e:
-        # fallback without parse mode
+        log.warning("primary buy send failed chat=%s token=%s source=%s err=%s", chat_id, token.get("symbol") or token.get("address"), source, e)
         try:
             await app.bot.send_message(chat_id=chat_id, text=re.sub(r"<[^>]+>", "", msg), disable_web_page_preview=True)
-        except Exception:
-            log.debug("send fail %s", e)
+            try:
+                log.info("buy posted via fallback chat=%s token=%s source=%s ton=%.4f tx=%s", chat_id, token.get("symbol") or token.get("address"), source, ton_amt, tx[:24])
+            except Exception:
+                pass
+        except Exception as e2:
+            log.warning("fallback buy send failed chat=%s token=%s source=%s err=%s", chat_id, token.get("symbol") or token.get("address"), source, e2)
 
     # Optional mirroring into official trending channel
     if MIRROR_TO_TRENDING and TRENDING_POST_CHAT_ID and str(chat_id) != str(TRENDING_POST_CHAT_ID):
@@ -6692,6 +6726,7 @@ def main():
     application.add_handler(CommandHandler("delpair", delpair_cmd))
     application.add_handler(CommandHandler("adset", adset_cmd))
     application.add_handler(CommandHandler("adclear", adclear_cmd))
+    application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("adstatus", adstatus_cmd))
     application.add_handler(CallbackQueryHandler(on_replace_button, pattern=r"^(REPL_|CANCEL_REPL$)"))
     application.add_handler(CallbackQueryHandler(on_button))
@@ -6704,6 +6739,9 @@ def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
     log.info("KYRON Public BuyBot starting...")
+    log.info("startup config: poll_interval=%s poll_concurrency=%s tonapi_timeout=%s tonapi_key=%s groups=%s global_tokens=%s", POLL_INTERVAL, max(1, int(os.getenv("POLL_CONCURRENCY", "2"))), TONAPI_TIMEOUT, ("yes" if TONAPI_KEY else "no"), len(GROUPS or {}), len(GLOBAL_TOKENS or {}))
+    if not TONAPI_KEY:
+        log.warning("TONAPI_KEY is missing; buy detection may be slow or rate-limited")
     # If you accidentally deploy 2 instances, Telegram will throw Conflict (two getUpdates loops).
     # We retry instead of crashing the container.
     while True:
