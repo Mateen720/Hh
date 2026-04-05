@@ -3,6 +3,7 @@ import os, json, time, asyncio, logging, re, html, base64
 from typing import Any, Dict, Optional, List, Tuple
 from urllib.parse import urlparse, quote
 import requests
+import threading
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -24,8 +25,8 @@ log = logging.getLogger("spyton_public")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
-POLL_INTERVAL = max(0.05, float(os.getenv("POLL_INTERVAL", "0.08")))
-TONAPI_TIMEOUT = max(2.0, float(os.getenv("TONAPI_TIMEOUT", "4")))
+POLL_INTERVAL = max(0.20, float(os.getenv("POLL_INTERVAL", "1.20")))
+TONAPI_TIMEOUT = max(3.0, float(os.getenv("TONAPI_TIMEOUT", "8")))
 STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "0")).strip().lower() in ("1","true","yes","on")
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600"))))
@@ -77,8 +78,8 @@ DEFAULT_AD_TEXT = os.getenv("DEFAULT_AD_TEXT", "Рекламируйтесь з�
 DEFAULT_AD_LINK = os.getenv("DEFAULT_AD_LINK", "https://t.me/vseeton").strip()
 GECKO_BASE = os.getenv("GECKO_BASE", "https://api.geckoterminal.com/api/v2").strip().rstrip("/")
 BLUM_BONDING_CAP_TON = float(os.getenv("BLUM_BONDING_CAP_TON", "1500").strip() or 1500)
-BLUM_EVENT_LIMIT = max(20, int(float(os.getenv("BLUM_EVENT_LIMIT", "80"))))
-BLUM_TX_LIMIT = max(20, int(float(os.getenv("BLUM_TX_LIMIT", "80"))))
+BLUM_EVENT_LIMIT = max(20, int(float(os.getenv("BLUM_EVENT_LIMIT", "40"))))
+BLUM_TX_LIMIT = max(20, int(float(os.getenv("BLUM_TX_LIMIT", "40"))))
 LAUNCHPAD_DISCOVERY_LIMIT = max(12, int(float(os.getenv("LAUNCHPAD_DISCOVERY_LIMIT", "24"))))
 LAUNCHPAD_DISCOVERY_HOLDER_LIMIT = max(6, int(float(os.getenv("LAUNCHPAD_DISCOVERY_HOLDER_LIMIT", "12"))))
 LAUNCHPAD_DISCOVERY_REFRESH_SEC = max(60, int(float(os.getenv("LAUNCHPAD_DISCOVERY_REFRESH_SEC", "600"))))
@@ -2037,16 +2038,64 @@ def tonapi_headers() -> Dict[str, str]:
         return {"Accept": "application/json"}
     return {"Authorization": f"Bearer {TONAPI_KEY}", "Accept": "application/json"}
 
-def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
-    """HTTP GET helper for TonAPI with light retry/backoff.
+TONAPI_MIN_INTERVAL = max(0.05, float(os.getenv("TONAPI_MIN_INTERVAL", "0.18")))
+_TONAPI_LAST_REQ_TS = 0.0
+_TONAPI_REQ_LOCK = threading.Lock()
+_TONAPI_CACHE: Dict[str, Tuple[float, Any]] = {}
 
-    Without a TONAPI key, TonAPI can rate-limit (429). We retry a few times and
-    fall back to the last known holders value in the caller if still unavailable.
+
+def _tonapi_cache_key(url: str, params: Optional[Dict[str, Any]] = None) -> str:
+    try:
+        if params:
+            payload = json.dumps(params, sort_keys=True, ensure_ascii=False, default=str)
+        else:
+            payload = ""
+    except Exception:
+        payload = str(params or "")
+    return f"{url}?{payload}"
+
+
+def _tonapi_cache_ttl(url: str) -> float:
+    u = str(url or "")
+    if "/blockchain/accounts/" in u and "/transactions" in u:
+        return 0.9
+    if "/accounts/" in u and "/events" in u:
+        return 0.9
+    if "/jettons/" in u and "/holders" in u:
+        return 20.0
+    if "/jettons/" in u:
+        return 30.0
+    return 3.0
+
+
+def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    """HTTP GET helper for TonAPI with retry, light client-side rate limiting,
+    and tiny TTL caching for hot account endpoints.
+
+    The previous build spammed TonAPI very aggressively (sub-second full scans,
+    high concurrency, repeated calls for the same pool/watch address), which can
+    lead to heavy 429s and the bot silently missing every buy. This helper slows
+    duplicate bursts down just enough to keep detection reliable.
     """
+    global _TONAPI_LAST_REQ_TS
+    cache_key = _tonapi_cache_key(url, params)
+    ttl = _tonapi_cache_ttl(url)
+    now = time.time()
+    cached = _TONAPI_CACHE.get(cache_key)
+    if cached and (now - float(cached[0])) < ttl:
+        return cached[1]
+
     headers = tonapi_headers()
     # retry on 429 / transient 5xx
     for attempt in range(3):
         try:
+            with _TONAPI_REQ_LOCK:
+                now2 = time.time()
+                wait = TONAPI_MIN_INTERVAL - (now2 - _TONAPI_LAST_REQ_TS)
+                if wait > 0:
+                    time.sleep(wait)
+                _TONAPI_LAST_REQ_TS = time.time()
+
             res = requests.get(url, headers=headers, params=params, timeout=TONAPI_TIMEOUT)
             # If the user provided a key but used the wrong header scheme, try X-API-Key once.
             if res.status_code in (401, 403) and TONAPI_KEY:
@@ -2058,12 +2107,14 @@ def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optiona
                 )
 
             if res.status_code == 200:
-                return res.json()
+                js = res.json()
+                _TONAPI_CACHE[cache_key] = (time.time(), js)
+                return js
 
             # rate limit or temporary server issues: backoff and retry
             if res.status_code in (429, 500, 502, 503, 504):
                 try:
-                    time.sleep(0.20 * (2 ** attempt))
+                    time.sleep(0.35 * (2 ** attempt))
                 except Exception:
                     pass
                 continue
@@ -2072,7 +2123,7 @@ def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optiona
         except Exception:
             # transient network errors
             try:
-                time.sleep(0.12 * (2 ** attempt))
+                time.sleep(0.20 * (2 ** attempt))
             except Exception:
                 pass
             continue
@@ -5531,12 +5582,12 @@ async def poll_once(app: Application):
         except Exception:
             pass
 
-    sem = asyncio.Semaphore(max(2, int(os.getenv("POLL_CONCURRENCY", "8"))))
+    sem = asyncio.Semaphore(max(1, int(os.getenv("POLL_CONCURRENCY", "3"))))
 
     async def _runner(chat_id: int, g: Dict[str, Any]):
         async with sem:
             try:
-                await _poll_chat_once(app, chat_id, g)
+                await asyncio.wait_for(_poll_chat_once(app, chat_id, g), timeout=max(12.0, TONAPI_TIMEOUT * 6))
             except Exception as e:
                 log.debug("poll chat err chat=%s %s", chat_id, e)
 
