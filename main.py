@@ -27,8 +27,8 @@ TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
 POLL_INTERVAL = max(0.08, float(os.getenv("POLL_INTERVAL", "0.12")))
 TONAPI_TIMEOUT = max(2.0, float(os.getenv("TONAPI_TIMEOUT", "4")))
 STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "0")).strip().lower() in ("1","true","yes","on")
-STON_FAST_HEAD_LIMIT = max(8, int(os.getenv("STON_FAST_HEAD_LIMIT", "18")))
-STON_FAST_EVENT_LIMIT = max(12, int(os.getenv("STON_FAST_EVENT_LIMIT", "20")))
+STON_FAST_HEAD_LIMIT = max(18, int(os.getenv("STON_FAST_HEAD_LIMIT", "36")))
+STON_FAST_EVENT_LIMIT = max(24, int(os.getenv("STON_FAST_EVENT_LIMIT", "48")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600"))))
 FAST_POST_MODE = str(os.getenv("FAST_POST_MODE", "1")).strip().lower() in ("1","true","yes","on")
@@ -79,11 +79,11 @@ DEFAULT_AD_TEXT = os.getenv("DEFAULT_AD_TEXT", "Рекламируйтесь з�
 DEFAULT_AD_LINK = os.getenv("DEFAULT_AD_LINK", "https://t.me/vseeton").strip()
 GECKO_BASE = os.getenv("GECKO_BASE", "https://api.geckoterminal.com/api/v2").strip().rstrip("/")
 BLUM_BONDING_CAP_TON = float(os.getenv("BLUM_BONDING_CAP_TON", "1500").strip() or 1500)
-BLUM_EVENT_LIMIT = max(20, int(float(os.getenv("BLUM_EVENT_LIMIT", "80"))))
-BLUM_TX_LIMIT = max(20, int(float(os.getenv("BLUM_TX_LIMIT", "80"))))
-LAUNCHPAD_DISCOVERY_LIMIT = max(12, int(float(os.getenv("LAUNCHPAD_DISCOVERY_LIMIT", "24"))))
-LAUNCHPAD_DISCOVERY_HOLDER_LIMIT = max(6, int(float(os.getenv("LAUNCHPAD_DISCOVERY_HOLDER_LIMIT", "12"))))
-LAUNCHPAD_DISCOVERY_REFRESH_SEC = max(60, int(float(os.getenv("LAUNCHPAD_DISCOVERY_REFRESH_SEC", "600"))))
+BLUM_EVENT_LIMIT = max(40, int(float(os.getenv("BLUM_EVENT_LIMIT", "150"))))
+BLUM_TX_LIMIT = max(40, int(float(os.getenv("BLUM_TX_LIMIT", "150"))))
+LAUNCHPAD_DISCOVERY_LIMIT = max(24, int(float(os.getenv("LAUNCHPAD_DISCOVERY_LIMIT", "60"))))
+LAUNCHPAD_DISCOVERY_HOLDER_LIMIT = max(12, int(float(os.getenv("LAUNCHPAD_DISCOVERY_HOLDER_LIMIT", "24"))))
+LAUNCHPAD_DISCOVERY_REFRESH_SEC = max(30, int(float(os.getenv("LAUNCHPAD_DISCOVERY_REFRESH_SEC", "90"))))
 
 
 def _load_addr_map_env(name: str) -> Dict[str, str]:
@@ -156,6 +156,8 @@ PREMIUM_EMOJI_DEFAULTS = {
     "buy": '<tg-emoji emoji-id="5352784961814405440">🐸</tg-emoji>',
     "listing": '<tg-emoji emoji-id="5424912684078348533">🔥</tg-emoji>',
 }
+
+BONDING_TITLE_EMOJI = os.getenv("BONDING_TITLE_EMOJI", "5409048419211682843").strip()
 
 def premium_icon(name: str, fallback: str = "") -> str:
     raw = os.getenv(f"PREMIUM_EMOJI_{name.upper()}", "").strip()
@@ -1091,7 +1093,7 @@ def launchpad_watch_addresses(token: Dict[str, Any]) -> List[str]:
 
     lp = token_launchpad(token, mapped_name)
     if lp in ("blum", "gaspump", "groypi", "groypad") or bool(token.get("blum_mode")):
-        for a in tonapi_jetton_holder_addresses(addr, 8):
+        for a in tonapi_jetton_holder_addresses(addr, 20):
             _add(a)
     _add(addr)
     return out
@@ -5348,7 +5350,8 @@ async def poll_once(app: Application):
 
                 # Refresh launchpad routing so memepad buys are not missed when each token has a different watch contract.
                 try:
-                    if refresh_launchpad_config(token):
+                    needs_force_lp = bool(token.get("blum_mode")) and not bool(token.get("launchpad_watch") or token.get("launchpad_watch_addresses"))
+                    if refresh_launchpad_config(token, force=needs_force_lp):
                         save_groups()
                 except Exception as _e:
                     log.debug("launchpad discovery err chat=%s %s", chat_id, _e)
@@ -5999,10 +6002,47 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     ad_text, ad_link, _left = active_ad()
     ad_line = f"ad: <a href=\"{h(ad_link)}\">{h(ad_text)}</a>" if ad_link else f"ad: {h(ad_text)}"
 
+    def _is_bonding_style() -> bool:
+        try:
+            src = str(source or "").lower()
+        except Exception:
+            src = ""
+        lp = str(token.get("launchpad") or "").lower()
+        return bool(token.get("blum_mode")) or ("blum" in src) or ("bond" in src) or (lp in ("blum", "gaspump", "groypi", "groypad"))
+
+    def _bonding_header_emoji() -> str:
+        if BONDING_TITLE_EMOJI:
+            return f'<tg-emoji emoji-id="{h(BONDING_TITLE_EMOJI)}">🛡️</tg-emoji>'
+        return premium_text_or_plain("title", "🛡️")
+
+    def _bonding_label_text() -> str:
+        lp = str(token.get("launchpad") or "").strip().lower()
+        if lp == "blum":
+            return "Blum"
+        if lp == "gaspump":
+            return "GasPump"
+        if lp in ("groypi", "groypad"):
+            return "Bonding"
+        if "blum" in str(source or "").lower():
+            return "Blum"
+        return "Bonding"
+
+    def _bonding_progress_bar(pct: Any, width: int = 14) -> str:
+        try:
+            v = max(0.0, min(100.0, float(pct or 0.0)))
+        except Exception:
+            v = 0.0
+        filled = int(round((v / 100.0) * width))
+        filled = max(0, min(width, filled))
+        return ("█" * filled) + ("▒" * (width - filled))
+
     def build_group_message() -> str:
         """Group buy card in the exact requested BUY style."""
         header_token = (title or tok_symbol or "TOKEN").strip()
-        header_inner = f'{premium_text_or_plain("title", "🛡️")} <b>{h(header_token)} BUY!</b>'
+        if _is_bonding_style():
+            header_inner = f'{_bonding_header_emoji()} <b>{h(header_token)} BUY!</b> — {_bonding_label_text()}'
+        else:
+            header_inner = f'{premium_text_or_plain("title", "🛡️")} <b>{h(header_token)} BUY!</b>'
         if tg_link:
             header = f'<a href="{h(tg_link)}">{header_inner}</a>'
         elif chart_link:
@@ -6088,7 +6128,14 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         """Trending channel style (only). Keeps all clickable links, but uses the requested layout."""
         # Header: | TOKEN Buy! (TOKEN clickable to Telegram when available)
         header_token = tok_symbol or title
-        if tg_link:
+        if _is_bonding_style():
+            if tg_link:
+                header = f'{_bonding_header_emoji()} <a href="{h(tg_link)}"><b>{h(header_token)}</b></a> Buy! — {_bonding_label_text()}'
+            elif chart_link:
+                header = f'{_bonding_header_emoji()} <a href="{h(chart_link)}"><b>{h(header_token)}</b></a> Buy! — {_bonding_label_text()}'
+            else:
+                header = f'{_bonding_header_emoji()} <b>{h(header_token)}</b> Buy! — {_bonding_label_text()}'
+        elif tg_link:
             header = f'{premium_text_or_plain("title", "🚀")} | <a href="{h(tg_link)}"><b>{h(header_token)}</b></a> Buy! {premium_text_or_plain("dex", "✨")}'
         elif chart_link:
             header = f'{premium_text_or_plain("title", "🚀")} | <a href="{h(chart_link)}"><b>{h(header_token)}</b></a> Buy! {premium_text_or_plain("dex", "✨")}'
@@ -6170,6 +6217,14 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         blocks.append(buyer_line_ch)
         blocks.append(price_line)
         blocks.append(mc_line_ch)
+        if _is_bonding_style():
+            try:
+                prog_pct = float(token.get("blum_progress_pct") or 0.0)
+            except Exception:
+                prog_pct = 0.0
+            blocks.append("")
+            blocks.append(f"Bonding Progress: {prog_pct:.2f}%")
+            blocks.append(_bonding_progress_bar(prog_pct))
         blocks.append("")
         blocks.append(links_row)
         blocks.append(ad_line)
