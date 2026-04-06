@@ -1434,16 +1434,73 @@ DEFAULT_SETTINGS = {
     "show_holders": True,
 }
 
+def _json_effectively_empty(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, (dict, list, str, tuple, set)):
+        return len(v) == 0
+    return False
+
+
+def _candidate_fallback_paths(path: str) -> List[str]:
+    out: List[str] = []
+    base = os.path.basename(path or "")
+    if not base:
+        return out
+    local_candidates = [
+        base,
+        os.path.join(os.getcwd(), base),
+        os.path.join(os.path.dirname(__file__), base),
+    ]
+    seen = set()
+    for cand in local_candidates:
+        cand = str(cand or "").strip()
+        if not cand or cand == path or cand in seen:
+            continue
+        seen.add(cand)
+        out.append(cand)
+    return out
+
+
 def _load_json(path: str, default):
-    try:
-        if path:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+    if not path:
         return default
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except Exception:
+        pass
+
+    # 1) Prefer the configured path (usually persistent storage like /data)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not _json_effectively_empty(data):
+            return data
+    except Exception:
+        data = None
+
+    # 2) Fallback to bundled/local file when persistent storage is empty or missing.
+    # This prevents the bot from coming up with zero tracked tokens after a fresh deploy.
+    for cand in _candidate_fallback_paths(path):
+        try:
+            with open(cand, "r", encoding="utf-8") as f:
+                data2 = json.load(f)
+            if _json_effectively_empty(data2):
+                continue
+            try:
+                # bootstrap persistent copy so later writes go to the configured path
+                if os.path.abspath(cand) != os.path.abspath(path):
+                    _save_json(path, data2)
+                    log.info("Bootstrapped data file %s from %s", path, cand)
+            except Exception as boot_err:
+                log.warning("Failed to bootstrap %s from %s: %s", path, cand, boot_err)
+            return data2
+        except Exception:
+            continue
+
+    return default
 
 def _save_json(path: str, obj):
     parent = os.path.dirname(path)
@@ -6774,7 +6831,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _log_startup_state():
     active_groups = sum(1 for _k, _g in (GROUPS or {}).items() if isinstance(_g, dict) and isinstance(_g.get("token"), dict) and str((_g.get("token") or {}).get("address") or "").strip())
     global_tokens = sum(1 for _k, _v in (GLOBAL_TOKENS or {}).items() if isinstance(_v, dict) and str((_v.get("address") or _k or "")).strip())
-    log.info("Startup state: DATA_DIR=%s groups=%s active_groups=%s global_tokens=%s seen_buckets=%s", DATA_DIR or "(local)", len(GROUPS or {}), active_groups, global_tokens, len(SEEN or {}))
+    log.info("Startup state: DATA_DIR=%s groups=%s active_groups=%s global_tokens=%s seen_buckets=%s files=[groups=%s tokens=%s seen=%s]", DATA_DIR or "(local)", len(GROUPS or {}), active_groups, global_tokens, len(SEEN or {}), DATA_FILE, GLOBAL_TOKENS_FILE, SEEN_FILE)
     if active_groups == 0 and global_tokens == 0:
         log.warning("tracker idle: no active tokens configured")
 
