@@ -45,18 +45,36 @@ TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/KYRONTrending").strip()
 DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/KYRONEco").strip()
 LISTING_URL = os.getenv("LISTING_URL", "https://t.me/KYRONListing").strip()
 
-DATA_DIR = os.getenv("DATA_DIR", "").strip()
+def _resolve_data_dir() -> str:
+    env_dir = os.getenv("DATA_DIR", "").strip()
+    candidates = []
+    if env_dir:
+        candidates.append(env_dir)
+    for cand in ("/data", "/app/data", "data"):
+        if cand not in candidates:
+            candidates.append(cand)
+    for cand in candidates:
+        try:
+            if not cand:
+                continue
+            os.makedirs(cand, exist_ok=True)
+            probe = os.path.join(cand, ".write_test")
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+            return cand
+        except Exception:
+            continue
+    return ""
+
+DATA_DIR = _resolve_data_dir()
+
 def _data_path(p: str) -> str:
     if not p:
         return p
     if DATA_DIR and (not os.path.isabs(p)):
         return os.path.join(DATA_DIR, p)
     return p
-if DATA_DIR:
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception:
-        pass
 
 # Trending leaderboard (Top-10) message in the trending channel.
 LEADERBOARD_ON = str(os.getenv("LEADERBOARD_ON", "1")).strip().lower() in ("1","true","yes","on")
@@ -1418,12 +1436,19 @@ DEFAULT_SETTINGS = {
 
 def _load_json(path: str, default):
     try:
+        if path:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
 
 def _save_json(path: str, obj):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
@@ -6352,9 +6377,17 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             pass
 
 async def tracker_loop(app: Application):
+    last_idle_log = 0.0
     while True:
         cycle_started = time.monotonic()
         try:
+            active_groups = sum(1 for _k, _g in (GROUPS or {}).items() if isinstance(_g, dict) and isinstance(_g.get("token"), dict) and str((_g.get("token") or {}).get("address") or "").strip())
+            global_tokens = sum(1 for _k, _v in (GLOBAL_TOKENS or {}).items() if isinstance(_v, dict) and str((_v.get("address") or _k or "")).strip())
+            if active_groups == 0 and global_tokens == 0:
+                now = time.monotonic()
+                if now - last_idle_log >= 60:
+                    log.warning("tracker idle: no active tokens configured")
+                    last_idle_log = now
             await poll_once(app)
         except Exception as e:
             log.exception("tracker loop error: %s", e)
@@ -6669,10 +6702,13 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat.type not in ("group","supergroup"):
             return
         if new and new.status in ("member","administrator"):
+            chat_id = int(chat.id)
+            user = getattr(my_chat_member, "from_user", None)
+            lang = _get_group_lang(chat_id, user.id if user else None)
             await context.bot.send_message(
                 chat_id=chat.id,
-                text=_spyton_home_text(_get_group_lang(chat_id, user.id if user else None)),
-                reply_markup=_group_home_keyboard(_get_group_lang(chat_id, user.id if user else None)),
+                text=_spyton_home_text(lang),
+                reply_markup=_group_home_keyboard(lang),
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
             )
@@ -6701,6 +6737,48 @@ async def post_init(app: Application):
         app.create_task(leaderboard_loop(app))
         log.info("Leaderboard loop started.")
 
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat = update.effective_chat
+        chat_id = int(chat.id) if chat else 0
+    except Exception:
+        chat_id = 0
+    g = GROUPS.get(str(chat_id)) if chat_id else None
+    token = (g or {}).get("token") if isinstance(g, dict) else None
+    token_addr = str((token or {}).get("address") or "").strip() if isinstance(token, dict) else ""
+    ston_pool = str((token or {}).get("ston_pool") or "").strip() if isinstance(token, dict) else ""
+    dedust_pool = str((token or {}).get("dedust_pool") or "").strip() if isinstance(token, dict) else ""
+    launchpad = str((token or {}).get("launchpad") or "").strip() if isinstance(token, dict) else ""
+    active_groups = sum(1 for _k, _g in (GROUPS or {}).items() if isinstance(_g, dict) and isinstance(_g.get("token"), dict) and str((_g.get("token") or {}).get("address") or "").strip())
+    global_tokens = sum(1 for _k, _v in (GLOBAL_TOKENS or {}).items() if isinstance(_v, dict) and str((_v.get("address") or _k or "")).strip())
+    lines = [
+        "<b>KYRON Status</b>",
+        f"DATA_DIR: <code>{html.escape(DATA_DIR or '(local)')}</code>",
+        f"Groups with token: <b>{active_groups}</b>",
+        f"Global tokens: <b>{global_tokens}</b>",
+    ]
+    if token_addr:
+        lines.extend([
+            "",
+            "<b>This chat</b>",
+            f"Token: <code>{html.escape(token_addr)}</code>",
+            f"STON pool: <code>{html.escape(ston_pool or '-')}</code>",
+            f"DeDust pool: <code>{html.escape(dedust_pool or '-')}</code>",
+            f"Launchpad: <code>{html.escape(launchpad or '-')}</code>",
+        ])
+    else:
+        lines.extend(["", "<b>This chat</b>", "No active token configured."])
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
+def _log_startup_state():
+    active_groups = sum(1 for _k, _g in (GROUPS or {}).items() if isinstance(_g, dict) and isinstance(_g.get("token"), dict) and str((_g.get("token") or {}).get("address") or "").strip())
+    global_tokens = sum(1 for _k, _v in (GLOBAL_TOKENS or {}).items() if isinstance(_v, dict) and str((_v.get("address") or _k or "")).strip())
+    log.info("Startup state: DATA_DIR=%s groups=%s active_groups=%s global_tokens=%s seen_buckets=%s", DATA_DIR or "(local)", len(GROUPS or {}), active_groups, global_tokens, len(SEEN or {}))
+    if active_groups == 0 and global_tokens == 0:
+        log.warning("tracker idle: no active tokens configured")
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is missing.")
@@ -6708,6 +6786,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("lang", lang_cmd))
+    application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("addtoken", addtoken_cmd))
     application.add_handler(CommandHandler("tokens", tokens_cmd))
     application.add_handler(CommandHandler("mytokens", tokens_cmd))
@@ -6727,6 +6806,7 @@ def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
     log.info("KYRON Public BuyBot starting...")
+    _log_startup_state()
     # If you accidentally deploy 2 instances, Telegram will throw Conflict (two getUpdates loops).
     # We retry instead of crashing the container.
     while True:
