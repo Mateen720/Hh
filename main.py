@@ -1172,6 +1172,52 @@ def infer_launchpad_routes_for_token(token_addr: str, seed_addresses: Optional[L
     return found_name, watch_addrs, opcodes
 
 
+
+
+def refresh_token_market_routes(token: Dict[str, Any], force: bool = False) -> bool:
+    """Best-effort refresh of STON/DeDust pool routing for already-added tokens.
+
+    This helps recover from cases where the token was added before the pool existed,
+    or the initial pool lookup failed temporarily.
+    """
+    if not isinstance(token, dict):
+        return False
+    jetton = str(token.get("address") or "").strip()
+    if not jetton:
+        return False
+
+    now = int(time.time())
+    try:
+        last = int(token.get("market_routes_refresh_ts") or 0)
+    except Exception:
+        last = 0
+    if (not force) and last and (now - last) < 120:
+        return False
+
+    changed = False
+    try:
+        ston_pool = find_stonfi_ton_pair_for_token(jetton)
+        if ston_pool and ston_pool != str(token.get("ston_pool") or "").strip():
+            token["ston_pool"] = ston_pool
+            changed = True
+    except Exception:
+        pass
+    try:
+        dedust_pool = find_dedust_ton_pair_for_token(jetton)
+        if dedust_pool and dedust_pool != str(token.get("dedust_pool") or "").strip():
+            token["dedust_pool"] = dedust_pool
+            changed = True
+    except Exception:
+        pass
+
+    # If a real pool appears, disable pure-launchpad fallback mode.
+    if token.get("ston_pool") or token.get("dedust_pool"):
+        if token.get("blum_mode") and not token.get("launchpad_watch") and not token.get("launchpad_watch_addresses"):
+            token["blum_mode"] = False
+            changed = True
+
+    token["market_routes_refresh_ts"] = now
+    return changed
 def refresh_launchpad_config(token: Dict[str, Any], force: bool = False) -> bool:
     if not isinstance(token, dict):
         return False
@@ -2205,15 +2251,12 @@ def tonapi_account_events_subject(address: str, limit: int = 30) -> List[Dict[st
     return ev if isinstance(ev, list) else []
 
 def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
-    """Best-effort extraction of a *real* tx hash from a TonAPI event.
-
-    Important: TonAPI event_id is not always a transaction hash. Returning the
-    event id here causes wrong/missing Tonviewer Tx links and can also make
-    dedupe less reliable across feeds. Prefer base transaction hashes first and
-    only fall back to event_id when it itself decodes to a real 32-byte hash.
-    """
+    """Best-effort extraction of a real tx hash from a TonAPI event."""
     if not isinstance(ev, dict):
         return ""
+    eid = str(ev.get("event_id") or ev.get("id") or "").strip()
+    if eid:
+        return eid
     for act in (ev.get("actions") or []):
         if not isinstance(act, dict):
             continue
@@ -2229,14 +2272,13 @@ def tonapi_event_tx_hash(ev: Dict[str, Any]) -> str:
             if isinstance(tid, dict):
                 h = tid.get("hash") or tid.get("tx_hash") or tid.get("id")
                 h = str(h or "").strip()
-                if _normalize_tx_hash_to_hex(h):
+                if h:
                     return h
             h2 = t.get("hash") or t.get("tx_hash") or t.get("id")
             h2 = str(h2 or "").strip()
-            if _normalize_tx_hash_to_hex(h2):
+            if h2:
                 return h2
-    eid = str(ev.get("event_id") or ev.get("id") or "").strip()
-    return eid if _normalize_tx_hash_to_hex(eid) else ""
+    return ""
 
 def tonapi_find_tx_hash_by_lt(account: str, lt: str, limit: int = 40) -> str:
     """Find a real transaction hash for an account by LT (with cache + adaptive scan).
@@ -4783,6 +4825,14 @@ async def _poll_chat_once(app: Application, chat_id: int, g: Dict[str, Any]):
     if bool(token.get("paused", False)):
         return
 
+    # Re-discover pool routing in the background so tokens added before liquidity
+    # existed can start posting automatically once a pool goes live.
+    try:
+        if refresh_token_market_routes(token):
+            save_groups()
+    except Exception as _e:
+        log.debug("route refresh err chat=%s %s", chat_id, _e)
+
     if not token.get("init_done"):
         try:
             await warmup_seen_for_chat(chat_id, token.get("ston_pool"), token.get("dedust_pool"))
@@ -5507,6 +5557,75 @@ async def _poll_chat_once(app: Application, chat_id: int, g: Dict[str, Any]):
         except Exception as e:
             log.debug("Blum poll err chat=%s %s", chat_id, e)
 
+    # Last-resort fallback: inspect the token account itself.
+    # This catches cases where pool/watch routing is stale or temporary API lookups miss the
+    # correct contract, which otherwise can make the bot look completely silent.
+    try:
+        txs_token = await _to_thread(tonapi_account_transactions, token.get("address"), 20)
+        if isinstance(txs_token, list) and txs_token:
+            last_token_tx = str(token.get("last_token_tx") or "").strip()
+            ignore_before = effective_ignore_before_ts(token)
+            new_txs = []
+            for txo in txs_token:
+                if not isinstance(txo, dict):
+                    continue
+                txh0 = str(_tx_hash(txo) or "").strip()
+                if last_token_tx and txh0 and txh0 == last_token_tx:
+                    break
+                uts0 = 0
+                try:
+                    uts0 = int(txo.get("utime") or txo.get("now") or txo.get("timestamp") or 0)
+                except Exception:
+                    uts0 = 0
+                if ignore_before and uts0 and uts0 < ignore_before:
+                    continue
+                if is_stale_buy_ts(uts0, max(OLD_BUY_MAX_AGE_SEC, 7200)):
+                    continue
+                new_txs.append(txo)
+
+            for txo in reversed(new_txs):
+                candidates = []
+                try:
+                    candidates.extend(stonfi_extract_buys_from_tonapi_tx(txo, token["address"]))
+                except Exception:
+                    pass
+                try:
+                    candidates.extend(blum_extract_buys_from_tonapi_tx(
+                        txo,
+                        token["address"],
+                        expected_watch=(token.get("launchpad_watch") or ""),
+                        expected_opcode=(token.get("launchpad_opcode") or ""),
+                    ))
+                except Exception:
+                    pass
+
+                for b in candidates:
+                    ton_amt = float(b.get("ton") or 0.0)
+                    if ton_amt > 1e5:
+                        ton_amt = ton_amt / 1e9
+                    if ton_amt < min_buy:
+                        continue
+                    txh = _normalize_tx_hash_to_hex(b.get("tx") or _tx_hash(txo) or "")
+                    dedupe_key = ('tx:' + txh) if txh else ('token-tx:' + str(token.get("address")) + ':' + str(txo.get("lt") or ''))
+                    if not dedupe_ok(chat_id, dedupe_key):
+                        continue
+                    if settings.get("burst_mode", True) and burst["count"] >= max_msgs:
+                        continue
+                    burst["count"] += 1
+                    await post_buy(app, chat_id, token, {
+                        "tx": b.get("tx") or _tx_hash(txo),
+                        "buyer": b.get("buyer"),
+                        "ton": ton_amt,
+                        "token_amount": float(b.get("token_amount") or 0.0),
+                    }, source=launchpad_label(token, str(b.get("launchpad") or "TonAPI")))
+
+            newest_token_tx = str(_tx_hash(txs_token[0]) or "").strip()
+            if newest_token_tx:
+                token["last_token_tx"] = newest_token_tx
+            save_groups()
+    except Exception as e:
+        log.debug("token fallback poll err chat=%s %s", chat_id, e)
+
 # save seen occasionally
 save_seen()
 
@@ -5603,7 +5722,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         refresh_remote_market = False
 
     if pool_for_market and refresh_remote_market:
-        pinfo = await _to_thread(gecko_pool_info, pool_for_market)
+        pinfo = gecko_pool_info(pool_for_market)
         if pinfo:
             pv = _to_float(pinfo.get("price_usd"))
             if pv is not None:
@@ -5621,7 +5740,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         # even when GeckoTerminal returns a blank market cap.
         if mc_usd is None or liq_usd is None or price_usd is None:
             try:
-                dpair = await _to_thread(_dex_pair_lookup, pool_for_market)
+                dpair = _dex_pair_lookup(pool_for_market)
             except Exception:
                 dpair = None
             if isinstance(dpair, dict):
@@ -5634,7 +5753,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     mc_usd = _to_float(dpair.get("marketCap") or dpair.get("market_cap") or dpair.get("fdv") or dpair.get("fdv_usd"))
 
     if (price_usd is None or mc_usd is None) and token.get("address") and refresh_remote_market:
-        tinfo = await _to_thread(gecko_token_info, token["address"])
+        tinfo = gecko_token_info(token["address"])
         if tinfo:
             if price_usd is None:
                 pv = _to_float(tinfo.get("price_usd"))
@@ -5669,7 +5788,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         # TonAPI Jetton info sometimes includes holders_count. If not, fall back
         # to the dedicated holders endpoint.
         try:
-            info = await _to_thread(tonapi_jetton_info, jetton_addr)
+            info = tonapi_jetton_info(jetton_addr)
             h = info.get("holders_count")
             if h is not None:
                 holders = int(h)
@@ -5677,7 +5796,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             pass
         if holders is None:
             try:
-                h2 = await _to_thread(tonapi_jetton_holders_count, jetton_addr)
+                h2 = tonapi_jetton_holders_count(jetton_addr)
                 if h2 is not None:
                     holders = int(h2)
             except Exception:
@@ -5701,7 +5820,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         total_supply = None
     if total_supply is None and jetton_addr and refresh_remote_market:
         try:
-            info = await _to_thread(tonapi_get, f"{TONAPI_BASE}/v2/jettons/{jetton_addr}") or {}
+            info = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton_addr}") or {}
             meta = info.get("metadata") or {}
             dec_raw = (meta.get("decimals") if isinstance(meta, dict) else None)
             if dec_raw is None:
@@ -5736,7 +5855,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         if TON_PRICE_CACHE.get("usd") is not None and _now - int(TON_PRICE_CACHE.get("ts") or 0) < 600:
             ton_usd = float(TON_PRICE_CACHE.get("usd"))
         elif not FAST_POST_MODE:
-            ton_usd = await _to_thread(ton_usd_price)
+            ton_usd = ton_usd_price()
     except Exception:
         ton_usd = None
     if ton_usd and ton_usd > 0:
@@ -5826,15 +5945,15 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     if not tx_hex and source == "DeDust":
         lt_guess = str(b.get("trade_id") or tx or "").strip()
         if lt_guess:
-            resolved = await _to_thread(tonapi_find_tx_hash_by_lt, str(dedust_pool or ""), lt_guess, 300)
+            resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=300)
             if not resolved:
                 # quick retries for busy pools
                 for _ in range(3):
                     try:
-                        await asyncio.sleep(0.35)
+                        time.sleep(0.35)
                     except Exception:
                         pass
-                    resolved = await _to_thread(tonapi_find_tx_hash_by_lt, str(dedust_pool or ""), lt_guess, 600)
+                    resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=600)
                     if resolved:
                         break
             tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
@@ -5846,7 +5965,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     change_pct = None
     try:
         if pair_for_links:
-            _p = await _to_thread(_dex_pair_lookup, pair_for_links)
+            _p = _dex_pair_lookup(pair_for_links)
             if isinstance(_p, dict):
                 _pc = _p.get("priceChange") or {}
                 _ch = None
