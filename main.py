@@ -27,6 +27,8 @@ TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
 POLL_INTERVAL = max(0.08, float(os.getenv("POLL_INTERVAL", "0.12")))
 TONAPI_TIMEOUT = max(2.0, float(os.getenv("TONAPI_TIMEOUT", "4")))
 STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "0")).strip().lower() in ("1","true","yes","on")
+STON_FAST_HEAD_LIMIT = max(8, int(os.getenv("STON_FAST_HEAD_LIMIT", "18")))
+STON_FAST_EVENT_LIMIT = max(12, int(os.getenv("STON_FAST_EVENT_LIMIT", "20")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600"))))
 FAST_POST_MODE = str(os.getenv("FAST_POST_MODE", "1")).strip().lower() in ("1","true","yes","on")
@@ -4866,18 +4868,31 @@ async def poll_once(app: Application):
                 # Pool transactions often appear a bit earlier than TonAPI /events.
                 posted_any = False
                 try:
-                    txs_fast = await _to_thread(tonapi_account_transactions, pool, 4)
+                    txs_fast = await _to_thread(tonapi_account_transactions, pool, STON_FAST_HEAD_LIMIT)
                     if isinstance(txs_fast, list) and txs_fast:
                         ignore_before = effective_ignore_before_ts(token)
+                        try:
+                            last_fast_ut = int(token.get("last_ston_fast_utime") or 0)
+                        except Exception:
+                            last_fast_ut = 0
+                        last_fast_tx = str(token.get("last_ston_fast_tx") or "").strip()
+                        newest_seen_ut = last_fast_ut
+                        newest_seen_tx = last_fast_tx
                         for txo in reversed(txs_fast):
                             ut = int(txo.get("utime") or 0)
                             if ut <= 0:
                                 continue
+                            txo_hash = _normalize_tx_hash_to_hex(_tx_hash(txo))
+                            newest_seen_ut = max(newest_seen_ut, ut)
+                            if txo_hash:
+                                newest_seen_tx = txo_hash
                             if ignore_before and ut and ut < ignore_before:
                                 continue
-                            if is_stale_buy_ts(ut):
+                            if last_fast_ut and ut < last_fast_ut:
                                 continue
-                            if _stonfi_tx_has_explicit_sell(txo, token["address"]):
+                            if last_fast_ut and ut == last_fast_ut and last_fast_tx and txo_hash and txo_hash == last_fast_tx:
+                                continue
+                            if is_stale_buy_ts(ut):
                                 continue
                             if _stonfi_tx_has_explicit_sell(txo, token["address"]):
                                 continue
@@ -4896,10 +4911,14 @@ async def poll_once(app: Application):
                                 burst['count'] += 1
                                 await post_buy(app, chat_id, token, {'tx': txh, 'buyer': b.get('buyer'), 'ton': ton_amt, 'token_amount': token_amt}, source='STON.fi v2')
                                 posted_any = True
+                        if newest_seen_ut:
+                            token['last_ston_fast_utime'] = newest_seen_ut
+                        if newest_seen_tx:
+                            token['last_ston_fast_tx'] = newest_seen_tx
                 except Exception as _e:
                     log.debug('STON TonAPI tx head err chat=%s %s', chat_id, _e)
                 try:
-                    events = await _to_thread(tonapi_account_events_subject, pool, 12)
+                    events = await _to_thread(tonapi_account_events_subject, pool, STON_FAST_EVENT_LIMIT)
                     if isinstance(events, list) and events:
                         last_eid = str(token.get('last_ston_event_id') or '').strip()
                         try:
@@ -4959,9 +4978,10 @@ async def poll_once(app: Application):
                 except Exception as _e:
                     log.debug('STON TonAPI events err chat=%s %s', chat_id, _e)
 
+                # Keep the export-feed pass in the same cycle too.
+                # This avoids missing buys when the fast TonAPI path saw only part of a burst.
                 if posted_any and FAST_POST_MODE:
                     save_groups()
-                    continue
 
                 latest = await _to_thread(ston_latest_block)
                 if latest is None:
