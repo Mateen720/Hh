@@ -3021,27 +3021,8 @@ async def send_customize_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
     else:
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
-def _flow_prompt_emoji(chat_id: int) -> str:
-    return '<tg-emoji emoji-id="5314453632828055816">👇</tg-emoji>'
-
-
-def _flow_prompt_html(chat_id: int, text: str) -> str:
-    raw = str(text or "").strip()
-    prefix = _flow_prompt_emoji(chat_id)
-    for lead in ("👇 ", "👇", "ℹ️ ", "ℹ️", "✅ ", "✅"):
-        if raw.startswith(lead):
-            raw = raw[len(lead):].lstrip()
-            break
-    return f"{prefix} {h(raw)}"
-
-
 async def _send_customize_prompt(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str):
-    return await context.bot.send_message(
-        chat_id=chat_id,
-        text=_flow_prompt_html(chat_id, text),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+    return await context.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
 
 # -------------------- UI --------------------
 async def build_add_to_group_url(app: Application) -> str:
@@ -3449,7 +3430,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer(_settings_words(_get_group_lang(chat.id, user.id))["admins_only"], show_alert=True)
             return
         AWAITING[user.id] = {"group_id": chat.id, "stage": "GROUP_ADD", "dex": "both"}
-        await context.bot.send_message(chat_id=chat.id, text=_flow_prompt_html(chat.id, _settings_words(_get_group_lang(chat.id, user.id))["paste_ca"]), parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=chat.id, text=_settings_words(_get_group_lang(chat.id, user.id))["paste_ca"])
         return
 
     if data == "START_EDIT":
@@ -3591,7 +3572,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer(_settings_words(_get_group_lang(chat.id, user.id))["admins_only"], show_alert=True)
             return
         AWAITING[user.id] = {"group_id": chat.id, "stage": "GROUP_ADD", "dex": "both"}
-        await context.bot.send_message(chat_id=chat.id, text=_flow_prompt_html(chat.id, _settings_words(_get_group_lang(chat.id, user.id))["paste_ca"]), parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=chat.id, text=_settings_words(_get_group_lang(chat.id, user.id))["paste_ca"])
         return
 
 
