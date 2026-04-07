@@ -34,7 +34,6 @@ OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600")
 FAST_POST_MODE = str(os.getenv("FAST_POST_MODE", "1")).strip().lower() in ("1","true","yes","on")
 STARTUP_HISTORY_GRACE_SEC = max(0, int(float(os.getenv("STARTUP_HISTORY_GRACE_SEC", "120"))))
 PROCESS_START_TS = int(time.time())
-ASYNC_IO_WORKERS = max(8, int(float(os.getenv("ASYNC_IO_WORKERS", "24"))))
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/KYRONTrending").strip()
 DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/KYRONEco").strip()
@@ -3165,6 +3164,120 @@ def _extract_symbol_hint(rest: str) -> str:
             return ww.upper()
     return ""
 
+
+
+def _discover_token_setup_sync(jetton: str, dex_mode: str = "both", sym_hint: str = "") -> Dict[str, Any]:
+    """Resolve token metadata and pools synchronously.
+
+    Run this inside asyncio.to_thread so Telegram handlers stay responsive.
+    """
+    name = ""
+    sym = ""
+    gk = gecko_token_info(jetton)
+    name = (gk.get("name") or "").strip() if gk else ""
+    sym = (gk.get("symbol") or "").strip() if gk else ""
+    if not name and not sym:
+        info = tonapi_jetton_info(jetton)
+        name = (info.get("name") or "").strip()
+        sym = (info.get("symbol") or "").strip()
+    if not name and not sym:
+        dx = dex_token_info(jetton)
+        name = (dx.get("name") or "").strip()
+        sym = (dx.get("symbol") or "").strip()
+    if sym_hint:
+        sym = sym_hint
+    if not name:
+        name = "Token"
+    if not sym:
+        sym = (name[:10] or "TOKEN").upper()
+
+    holders_seed = None
+    try:
+        info_h = tonapi_jetton_info(jetton)
+        hh = info_h.get("holders_count")
+        if hh is not None:
+            holders_seed = int(hh)
+    except Exception:
+        pass
+    if holders_seed is None:
+        try:
+            hh2 = tonapi_jetton_holders_count(jetton)
+            if hh2 is not None:
+                holders_seed = int(hh2)
+        except Exception:
+            pass
+
+    decimals_seed = 9
+    try:
+        meta_j = get_jetton_meta(jetton)
+        decimals_seed = int(meta_j.get("decimals") or 9)
+    except Exception:
+        decimals_seed = 9
+
+    dm = (dex_mode or "both").lower().strip()
+    ston_pool = find_stonfi_ton_pair_for_token(jetton) if dm in ("both", "ston", "stonfi") else None
+    dedust_pool = find_dedust_ton_pair_for_token(jetton) if dm in ("both", "dedust") else None
+
+    if dedust_pool:
+        try:
+            p = _dex_pair_lookup(dedust_pool)
+            if isinstance(p, dict):
+                base = p.get("baseToken") or {}
+                quote = p.get("quoteToken") or {}
+                base_sym = str(base.get("symbol") or "").upper()
+                quote_sym = str(quote.get("symbol") or "").upper()
+                base_addr = str(base.get("address") or "").strip()
+                quote_addr = str(quote.get("address") or "").strip()
+                recovered = ""
+                if base_sym in ("TON", "WTON") and quote_addr:
+                    recovered = quote_addr
+                elif quote_sym in ("TON", "WTON") and base_addr:
+                    recovered = base_addr
+                elif base_addr:
+                    recovered = base_addr
+                elif quote_addr:
+                    recovered = quote_addr
+                if recovered and recovered != jetton:
+                    jetton = recovered
+                    gk2 = gecko_token_info(jetton)
+                    name2 = (gk2.get("name") or "").strip() if gk2 else ""
+                    sym2 = (gk2.get("symbol") or "").strip() if gk2 else ""
+                    if not name2 and not sym2:
+                        info2 = tonapi_jetton_info(jetton)
+                        name2 = (info2.get("name") or "").strip()
+                        sym2 = (info2.get("symbol") or "").strip()
+                    if not name2 and not sym2:
+                        dx2 = dex_token_info(jetton)
+                        name2 = (dx2.get("name") or "").strip()
+                        sym2 = (dx2.get("symbol") or "").strip()
+                    if name2 or sym2:
+                        name = name2 or name
+                        sym = sym2 or sym
+        except Exception:
+            pass
+
+    lp_name, lp_watches = launchpad_maps_for_token(jetton)
+    extra_holders = []
+    try:
+        extra_holders = tonapi_jetton_holder_addresses(jetton, 8)
+    except Exception:
+        extra_holders = []
+
+    return {
+        "address": jetton,
+        "name": name,
+        "symbol": sym,
+        "holders": holders_seed,
+        "decimals": int(decimals_seed) if str(decimals_seed).isdigit() else 9,
+        "ston_pool": ston_pool,
+        "dedust_pool": dedust_pool,
+        "launchpad": (lp_name if lp_name else ""),
+        "launchpad_watch": (lp_watches[0] if lp_watches else ""),
+        "launchpad_watch_addresses": (lp_watches + extra_holders),
+        "blum_mode": bool(lp_name in ("blum", "gaspump", "groypi", "groypad")) or bool(lp_watches),
+        "dex_mode": ("auto" if dm == "both" else dm),
+    }
+
 async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner-only: /addtoken <CA/link> [SYMBOL] [telegram_link]
 
@@ -3207,55 +3320,16 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rest = re.sub(r"https?://t\.me/\S+", "", rest)
     sym_hint = _extract_symbol_hint(rest)
 
-    # Build token record (reuse the same logic as group setup)
-    gk = await _to_thread(gecko_token_info, jetton)
-    name = (gk.get("name") or "").strip() if gk else ""
-    sym = (gk.get("symbol") or "").strip() if gk else ""
-    if not name and not sym:
-        info = await _to_thread(tonapi_jetton_info, jetton)
-        name = (info.get("name") or "").strip()
-        sym = (info.get("symbol") or "").strip()
-    if not name and not sym:
-        dx = await _to_thread(dex_token_info, jetton)
-        name = (dx.get("name") or "").strip()
-        sym = (dx.get("symbol") or "").strip()
-    if sym_hint:
-        sym = sym_hint
-
-    # Seed holders and decimals
-    holders_seed: Optional[int] = None
-    try:
-        info_h = await _to_thread(tonapi_jetton_info, jetton)
-        hh = info_h.get("holders_count")
-        if hh is not None:
-            holders_seed = int(hh)
-    except Exception:
-        pass
-    if holders_seed is None:
-        try:
-            hh2 = await _to_thread(tonapi_jetton_holders_count, jetton)
-            if hh2 is not None:
-                holders_seed = int(hh2)
-        except Exception:
-            pass
-    decimals_seed: int = 9
-    try:
-        meta_j = await _to_thread(get_jetton_meta, jetton)
-        decimals_seed = int(meta_j.get("decimals") or 9)
-    except Exception:
-        decimals_seed = 9
-
+    processing_msg = await update.message.reply_text("⏳ Adding token... Please wait.")
     dm = (dex_mode or "both").lower().strip()
-    ston_pool = await _to_thread(find_stonfi_ton_pair_for_token, jetton) if dm in ("both", "ston", "stonfi") else None
-    dedust_pool = await _to_thread(find_dedust_ton_pair_for_token, jetton) if dm in ("both", "dedust") else None
-    try:
-        lp_name, lp_watches = await _to_thread(launchpad_maps_for_token, jetton)
-    except Exception:
-        lp_name, lp_watches = "", []
-    try:
-        holder_watch_addrs = await _to_thread(tonapi_jetton_holder_addresses, jetton, 8)
-    except Exception:
-        holder_watch_addrs = []
+    setup = await _to_thread(_discover_token_setup_sync, jetton, dm, sym_hint)
+    jetton = str(setup.get("address") or jetton)
+    name = str(setup.get("name") or "").strip()
+    sym = str(setup.get("symbol") or "").strip()
+    holders_seed = setup.get("holders")
+    decimals_seed = int(setup.get("decimals") or 9)
+    ston_pool = setup.get("ston_pool")
+    dedust_pool = setup.get("dedust_pool")
 
     # Store token for global tracking
     tok = {
@@ -3268,10 +3342,10 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        "blum_mode": bool(lp_name in ("blum", "gaspump", "groypi", "groypad")) or bool(lp_watches),
-        "launchpad": (lp_name if lp_name else ""),
-        "launchpad_watch": (lp_watches[0] if lp_watches else ""),
-        "launchpad_watch_addresses": (lp_watches + holder_watch_addrs),
+        "blum_mode": bool(setup.get("blum_mode")),
+        "launchpad": str(setup.get("launchpad") or ""),
+        "launchpad_watch": str(setup.get("launchpad_watch") or ""),
+        "launchpad_watch_addresses": list(setup.get("launchpad_watch_addresses") or []),
         "launchpad_opcode": "",
         "launchpad_discovery_ts": 0,
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
@@ -3294,11 +3368,7 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "telegram": tg_url.strip() if tg_url else "",
     }
     try:
-        refresh_launchpad_config(tok, force=True)
-    except Exception as _e:
-        log.debug("initial launchpad discovery err %s", _e)
-    try:
-        refresh_launchpad_config(tok, force=True)
+        await _to_thread(lambda: refresh_launchpad_config(tok, force=True))
     except Exception as _e:
         log.debug("initial launchpad discovery err %s", _e)
     GLOBAL_TOKENS[str(jetton)] = tok
@@ -4456,7 +4526,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym = "TOKEN"
         holders = 0
         try:
-            info = await _to_thread(tonapi_jetton_info, addr)
+            info = tonapi_jetton_info(addr)
             name = (info.get("name") or name).strip()
             sym = (info.get("symbol") or sym).strip()
             holders = int(info.get("holders_count") or 0)
@@ -4616,113 +4686,21 @@ async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int, telegram: str = "", dex_mode: str = "both", announce: bool = True):
-    # Token metadata (GeckoTerminal first, then TonAPI, then DexScreener)
-    name = ""
-    sym = ""
+    processing_msg = None
     try:
-        gk = await _to_thread(gecko_token_info, jetton)
-        name = (gk.get("name") or "").strip() if gk else ""
-        sym = (gk.get("symbol") or "").strip() if gk else ""
+        processing_msg = await context.bot.send_message(chat_id=reply_chat_id, text="⏳ Processing token... Please wait.")
     except Exception:
-        pass
-    if not name and not sym:
-        try:
-            info = await _to_thread(tonapi_jetton_info, jetton)
-            name = (info.get("name") or "").strip()
-            sym = (info.get("symbol") or "").strip()
-        except Exception:
-            pass
-    if not name and not sym:
-        try:
-            dx = await _to_thread(dex_token_info, jetton)
-            name = (dx.get("name") or "").strip()
-            sym = (dx.get("symbol") or "").strip()
-        except Exception:
-            pass
-    if not name:
-        name = "Token"
-    if not sym:
-        sym = (name[:10] or "TOKEN").upper()
+        processing_msg = None
+
+    setup = await _to_thread(_discover_token_setup_sync, jetton, dex_mode, "")
+    jetton = str(setup.get("address") or jetton)
+    name = str(setup.get("name") or "Token")
+    sym = str(setup.get("symbol") or (name[:10] or "TOKEN").upper())
     dex_mode = (dex_mode or "both").lower().strip()
-    # Seed holders once at setup so first buys show holders immediately.
-    holders_seed: Optional[int] = None
-    try:
-        info_h = await _to_thread(tonapi_jetton_info, jetton)
-        hh = info_h.get("holders_count")
-        if hh is not None:
-            holders_seed = int(hh)
-    except Exception:
-        pass
-    if holders_seed is None:
-        try:
-            hh2 = await _to_thread(tonapi_jetton_holders_count, jetton)
-            if hh2 is not None:
-                holders_seed = int(hh2)
-        except Exception:
-            pass
-    # decimals for correct amount formatting
-    decimals_seed: int = 9
-    try:
-        meta_j = await _to_thread(get_jetton_meta, jetton)
-        decimals_seed = int(meta_j.get("decimals") or 9)
-    except Exception:
-        decimals_seed = 9
-
-    ston_pool = await _to_thread(find_stonfi_ton_pair_for_token, jetton) if dex_mode in ("both","ston","stonfi") else None
-    dedust_pool = await _to_thread(find_dedust_ton_pair_for_token, jetton) if dex_mode in ("both","dedust") else None
-    try:
-        lp_name, lp_watches = await _to_thread(launchpad_maps_for_token, jetton)
-    except Exception:
-        lp_name, lp_watches = "", []
-    try:
-        holder_watch_addrs = await _to_thread(tonapi_jetton_holder_addresses, jetton, 8)
-    except Exception:
-        holder_watch_addrs = []
-
-    # If the user pasted a non-canonical address (e.g. a site-added suffix like "-Lone"),
-    # we can still recover the correct jetton master from the resolved pool metadata.
-    # This prevents "pool found but no buys" situations caused by address mismatches.
-    if dedust_pool:
-        try:
-            p = _dex_pair_lookup(dedust_pool)
-            if isinstance(p, dict):
-                base = p.get("baseToken") or {}
-                quote = p.get("quoteToken") or {}
-                base_sym = str(base.get("symbol") or "").upper()
-                quote_sym = str(quote.get("symbol") or "").upper()
-                base_addr = str(base.get("address") or "").strip()
-                quote_addr = str(quote.get("address") or "").strip()
-                recovered = ""
-                if base_sym in ("TON", "WTON") and quote_addr:
-                    recovered = quote_addr
-                elif quote_sym in ("TON", "WTON") and base_addr:
-                    recovered = base_addr
-                elif base_addr:
-                    recovered = base_addr
-                elif quote_addr:
-                    recovered = quote_addr
-
-                if recovered and recovered != jetton:
-                    log.warning("Jetton address corrected via pool metadata: %s -> %s", jetton, recovered)
-                    jetton = recovered
-
-                    # Refresh metadata using the corrected address (best-effort).
-                    gk2 = gecko_token_info(jetton)
-                    name2 = (gk2.get("name") or "").strip() if gk2 else ""
-                    sym2 = (gk2.get("symbol") or "").strip() if gk2 else ""
-                    if not name2 and not sym2:
-                        info2 = tonapi_jetton_info(jetton)
-                        name2 = (info2.get("name") or "").strip()
-                        sym2 = (info2.get("symbol") or "").strip()
-                    if not name2 and not sym2:
-                        dx2 = dex_token_info(jetton)
-                        name2 = (dx2.get("name") or "").strip()
-                        sym2 = (dx2.get("symbol") or "").strip()
-                    if name2 or sym2:
-                        name = name2 or name
-                        sym = sym2 or sym
-        except Exception:
-            pass
+    holders_seed = setup.get("holders")
+    decimals_seed = int(setup.get("decimals") or 9)
+    ston_pool = setup.get("ston_pool")
+    dedust_pool = setup.get("dedust_pool")
 
     g = get_group(chat_id)
     # Auto-enable pools we actually found.
@@ -4751,10 +4729,10 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        "blum_mode": bool(lp_name in ("blum", "gaspump", "groypi", "groypad")) or bool(lp_watches),
-        "launchpad": (lp_name if lp_name else ""),
-        "launchpad_watch": (lp_watches[0] if lp_watches else ""),
-        "launchpad_watch_addresses": (lp_watches + holder_watch_addrs),
+        "blum_mode": bool(setup.get("blum_mode")),
+        "launchpad": str(setup.get("launchpad") or ""),
+        "launchpad_watch": str(setup.get("launchpad_watch") or ""),
+        "launchpad_watch_addresses": list(setup.get("launchpad_watch_addresses") or []),
         "launchpad_opcode": "",
         "launchpad_discovery_ts": 0,
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
@@ -4801,6 +4779,12 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         f"Now posting buys automatically for this group.\n"
         f"Use *Edit* to customize buy step, min buy, link, emoji, and media."
     )
+
+    try:
+        if processing_msg:
+            await processing_msg.delete()
+    except Exception:
+        pass
 
     if announce:
         await context.bot.send_message(
@@ -5600,7 +5584,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         refresh_remote_market = False
 
     if pool_for_market and refresh_remote_market:
-        pinfo = await _to_thread(gecko_pool_info, pool_for_market)
+        pinfo = gecko_pool_info(pool_for_market)
         if pinfo:
             pv = _to_float(pinfo.get("price_usd"))
             if pv is not None:
@@ -5618,7 +5602,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         # even when GeckoTerminal returns a blank market cap.
         if mc_usd is None or liq_usd is None or price_usd is None:
             try:
-                dpair = await _to_thread(_dex_pair_lookup, pool_for_market)
+                dpair = _dex_pair_lookup(pool_for_market)
             except Exception:
                 dpair = None
             if isinstance(dpair, dict):
@@ -5631,7 +5615,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     mc_usd = _to_float(dpair.get("marketCap") or dpair.get("market_cap") or dpair.get("fdv") or dpair.get("fdv_usd"))
 
     if (price_usd is None or mc_usd is None) and token.get("address") and refresh_remote_market:
-        tinfo = await _to_thread(gecko_token_info, token["address"])
+        tinfo = gecko_token_info(token["address"])
         if tinfo:
             if price_usd is None:
                 pv = _to_float(tinfo.get("price_usd"))
@@ -5666,7 +5650,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         # TonAPI Jetton info sometimes includes holders_count. If not, fall back
         # to the dedicated holders endpoint.
         try:
-            info = await _to_thread(tonapi_jetton_info, jetton_addr)
+            info = tonapi_jetton_info(jetton_addr)
             h = info.get("holders_count")
             if h is not None:
                 holders = int(h)
@@ -5674,7 +5658,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             pass
         if holders is None:
             try:
-                h2 = await _to_thread(tonapi_jetton_holders_count, jetton_addr)
+                h2 = tonapi_jetton_holders_count(jetton_addr)
                 if h2 is not None:
                     holders = int(h2)
             except Exception:
@@ -5698,7 +5682,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         total_supply = None
     if total_supply is None and jetton_addr and refresh_remote_market:
         try:
-            info = await _to_thread(tonapi_get, f"{TONAPI_BASE}/v2/jettons/{jetton_addr}") or {}
+            info = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton_addr}") or {}
             meta = info.get("metadata") or {}
             dec_raw = (meta.get("decimals") if isinstance(meta, dict) else None)
             if dec_raw is None:
@@ -5823,7 +5807,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     if not tx_hex and source == "DeDust":
         lt_guess = str(b.get("trade_id") or tx or "").strip()
         if lt_guess:
-            resolved = await _to_thread(tonapi_find_tx_hash_by_lt, str(dedust_pool or ""), lt_guess, 300)
+            resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=300)
             if not resolved:
                 # quick retries for busy pools
                 for _ in range(3):
@@ -5831,7 +5815,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                         time.sleep(0.35)
                     except Exception:
                         pass
-                    resolved = await _to_thread(tonapi_find_tx_hash_by_lt, str(dedust_pool or ""), lt_guess, 600)
+                    resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=600)
                     if resolved:
                         break
             tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
@@ -5843,7 +5827,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     change_pct = None
     try:
         if pair_for_links:
-            _p = await _to_thread(_dex_pair_lookup, pair_for_links)
+            _p = _dex_pair_lookup(pair_for_links)
             if isinstance(_p, dict):
                 _pc = _p.get("priceChange") or {}
                 _ch = None
@@ -6696,15 +6680,6 @@ def run_flask():
 
 # -------------------- MAIN --------------------
 async def post_init(app: Application):
-    # grow the default thread pool so blocking HTTP helpers moved via asyncio.to_thread
-    # do not stall command handlers or the tracker loop under load.
-    try:
-        import concurrent.futures
-        loop = asyncio.get_running_loop()
-        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=ASYNC_IO_WORKERS))
-    except Exception:
-        pass
-
     # start tracker
     app.create_task(tracker_loop(app))
     log.info("Tracker started.")
@@ -6717,13 +6692,7 @@ async def post_init(app: Application):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is missing.")
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(True)
-        .post_init(post_init)
-        .build()
-    )
+    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).concurrent_updates(True).build()
 
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("lang", lang_cmd))
