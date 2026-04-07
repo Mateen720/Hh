@@ -26,7 +26,7 @@ TONAPI_KEY = os.getenv("TONAPI_KEY", "").strip()
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io").strip().rstrip("/")
 POLL_INTERVAL = max(0.08, float(os.getenv("POLL_INTERVAL", "0.12")))
 TONAPI_TIMEOUT = max(2.0, float(os.getenv("TONAPI_TIMEOUT", "4")))
-STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "0")).strip().lower() in ("1","true","yes","on")
+STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "1")).strip().lower() in ("1","true","yes","on")
 STON_FAST_HEAD_LIMIT = max(18, int(os.getenv("STON_FAST_HEAD_LIMIT", "36")))
 STON_FAST_EVENT_LIMIT = max(24, int(os.getenv("STON_FAST_EVENT_LIMIT", "48")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
@@ -5043,9 +5043,9 @@ async def poll_once(app: Application):
 
                 # Raw pool-tx fallback is slower and can misclassify edge-case sells on some STON pools
                 # (for example CUPRUM-style reversed action payloads). Keep it opt-in only.
-                if (not posted_any) and STON_TX_FALLBACK:
+                if STON_TX_FALLBACK:
                     try:
-                        txs = await _to_thread(tonapi_account_transactions, pool, 10)
+                        txs = await _to_thread(tonapi_account_transactions, pool, max(24, STON_FAST_HEAD_LIMIT))
                         # process oldest -> newest
                         txs = list(reversed(txs))
                         for txo in txs:
@@ -6008,7 +6008,16 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         except Exception:
             src = ""
         lp = str(token.get("launchpad") or "").lower()
-        return bool(token.get("blum_mode")) or ("blum" in src) or ("bond" in src) or (lp in ("blum", "gaspump", "groypi", "groypad"))
+        has_pool = bool(token.get("ston_pool") or token.get("dedust_pool"))
+        # Only use the separate bonding style for real bonding / memepad tokens.
+        # Normal STON.fi or DeDust tokens must keep the normal buy style.
+        if bool(token.get("blum_mode")):
+            return True
+        if "blum" in src and not has_pool:
+            return True
+        if lp in ("blum", "gaspump", "groypi", "groypad") and not has_pool:
+            return True
+        return False
 
     def _bonding_header_emoji() -> str:
         if BONDING_TITLE_EMOJI:
