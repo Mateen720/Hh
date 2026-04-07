@@ -3260,8 +3260,8 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         **(lambda _lp_name, _lp_watches: {
-            "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(_lp_watches),
-            "launchpad": (_lp_name if (_lp_name or ((not ston_pool) and (not dedust_pool))) else ""),
+            "blum_mode": bool(_lp_name in ("blum", "gaspump", "groypi", "groypad")) or bool(_lp_watches),
+            "launchpad": (_lp_name if _lp_name else ""),
             "launchpad_watch": (_lp_watches[0] if _lp_watches else ""),
             "launchpad_watch_addresses": (_lp_watches + tonapi_jetton_holder_addresses(jetton, 8)),
             "launchpad_opcode": "",
@@ -4737,8 +4737,8 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
         **(lambda _lp_name, _lp_watches: {
-            "blum_mode": bool((not ston_pool) and (not dedust_pool)) or bool(_lp_watches),
-            "launchpad": (_lp_name if (_lp_name or ((not ston_pool) and (not dedust_pool))) else ""),
+            "blum_mode": bool(_lp_name in ("blum", "gaspump", "groypi", "groypad")) or bool(_lp_watches),
+            "launchpad": (_lp_name if _lp_name else ""),
             "launchpad_watch": (_lp_watches[0] if _lp_watches else ""),
             "launchpad_watch_addresses": (_lp_watches + tonapi_jetton_holder_addresses(jetton, 8)),
             "launchpad_opcode": "",
@@ -5339,8 +5339,7 @@ async def poll_once(app: Application):
             token["blum_mode"] = bool(
                 token.get("blum_mode")
                 or token.get("launchpad_watch")
-                or (str(token.get("launchpad") or "").lower() == "groypad")
-                or ((not token.get("ston_pool")) and (not token.get("dedust_pool")))
+                or (str(token.get("launchpad") or "").lower() in ("blum", "gaspump", "groypi", "groypad"))
             )
         except Exception:
             token["blum_mode"] = bool(token.get("blum_mode")) or bool(token.get("launchpad_watch"))
@@ -6011,7 +6010,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         has_pool = bool(token.get("ston_pool") or token.get("dedust_pool"))
         # Only use the separate bonding style for real bonding / memepad tokens.
         # Normal STON.fi or DeDust tokens must keep the normal buy style.
-        if bool(token.get("blum_mode")):
+        if bool(token.get("blum_mode")) and lp in ("blum", "gaspump", "groypi", "groypad"):
             return True
         if "blum" in src and not has_pool:
             return True
