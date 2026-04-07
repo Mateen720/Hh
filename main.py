@@ -1577,10 +1577,23 @@ DEDUST_POOL_RE = re.compile(r"dedust\.(?:io|org)/[^\s]*?(?:pool|pools)/([A-Za-z0
 def is_private(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.type == "private")
 
+ADMIN_CACHE: Dict[Tuple[int, int], Tuple[int, bool]] = {}
+ADMIN_CACHE_TTL = int(os.getenv("ADMIN_CACHE_TTL", "15"))
+
 async def is_admin(bot, chat_id: int, user_id: int) -> bool:
+    now = int(time.time())
+    key = (int(chat_id), int(user_id))
+    try:
+        cached = ADMIN_CACHE.get(key)
+        if cached and (now - int(cached[0]) <= ADMIN_CACHE_TTL):
+            return bool(cached[1])
+    except Exception:
+        pass
     try:
         m = await bot.get_chat_member(chat_id, user_id)
-        return m.status in ("administrator", "creator")
+        ok = m.status in ("administrator", "creator")
+        ADMIN_CACHE[key] = (now, ok)
+        return ok
     except Exception:
         return False
 
@@ -1834,7 +1847,7 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
 
         # STON.fi (warmup by pool tx hashes from TonAPI)
         if ston_pool:
-            swaps = await stonfi_latest_swaps(ston_pool, limit=40)
+            swaps = await stonfi_latest_swaps(ston_pool, limit=12)
             for s in swaps:
                 txhash = (s.get('tx_hash') or s.get('txHash') or s.get('hash') or '').strip()
                 if txhash:
@@ -1842,7 +1855,7 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                     if newest_ston is None:
                         newest_ston = txhash  # first item is newest
             try:
-                ston_events0 = await _to_thread(tonapi_account_events, ston_pool, 40)
+                ston_events0 = await _to_thread(tonapi_account_events, ston_pool, 12)
                 if isinstance(ston_events0, list) and ston_events0:
                     newest0 = ston_events0[0]
                     newest_ston_eid = str(newest0.get('event_id') or newest0.get('id') or '').strip() or newest_ston_eid
@@ -1855,12 +1868,12 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
 
         # DeDust (warmup by latest trade ids and tx hashes where available)
         if dedust_pool:
-            trades = await dedust_latest_trades(dedust_pool, limit=60)
+            trades = await dedust_latest_trades(dedust_pool, limit=20)
             # TonAPI events baseline for DeDust pools that don't expose /trades yet (new/legacy pools)
             if not trades:
                 try:
                     # Full /events is safer for DeDust pools; subject_only can omit TON transfers.
-                    events = await _to_thread(tonapi_account_events, dedust_pool, 40)
+                    events = await _to_thread(tonapi_account_events, dedust_pool, 12)
                     if isinstance(events, list) and events:
                         newest = events[0]  # newest first
                         eid = str(newest.get('event_id') or newest.get('id') or '').strip()
@@ -4456,7 +4469,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym = "TOKEN"
         holders = 0
         try:
-            info = await _to_thread(tonapi_jetton_info, addr)
+            info = await _to_thread(get_jetton_meta, addr)
             name = (info.get("name") or name).strip()
             sym = (info.get("symbol") or sym).strip()
             holders = int(info.get("holders_count") or 0)
@@ -4616,68 +4629,85 @@ async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int, telegram: str = "", dex_mode: str = "both", announce: bool = True):
-    # Token metadata (GeckoTerminal first, then TonAPI, then DexScreener)
-    name = ""
-    sym = ""
-    try:
-        gk = await _to_thread(gecko_token_info, jetton)
-        name = (gk.get("name") or "").strip() if gk else ""
-        sym = (gk.get("symbol") or "").strip() if gk else ""
-    except Exception:
-        pass
-    if not name and not sym:
+    dex_mode = (dex_mode or "both").lower().strip()
+
+    async def _maybe(coro, enabled: bool):
+        if not enabled:
+            return None
         try:
-            info = await _to_thread(tonapi_jetton_info, jetton)
-            name = (info.get("name") or "").strip()
-            sym = (info.get("symbol") or "").strip()
+            return await coro
         except Exception:
-            pass
-    if not name and not sym:
-        try:
-            dx = await _to_thread(dex_token_info, jetton)
-            name = (dx.get("name") or "").strip()
-            sym = (dx.get("symbol") or "").strip()
-        except Exception:
-            pass
+            return None
+
+    # Run the expensive network lookups in parallel so add-token/edit-token responds faster.
+    gk_task = asyncio.create_task(_to_thread(gecko_token_info, jetton))
+    meta_task = asyncio.create_task(_to_thread(get_jetton_meta, jetton))
+    dx_task = asyncio.create_task(_to_thread(dex_token_info, jetton))
+    holders_task = asyncio.create_task(_to_thread(tonapi_jetton_holders_count, jetton))
+    ston_task = asyncio.create_task(_maybe(_to_thread(find_stonfi_ton_pair_for_token, jetton), dex_mode in ("both", "ston", "stonfi")))
+    dedust_task = asyncio.create_task(_maybe(_to_thread(find_dedust_ton_pair_for_token, jetton), dex_mode in ("both", "dedust")))
+    launchpad_task = asyncio.create_task(_to_thread(launchpad_maps_for_token, jetton))
+    holder_watch_task = asyncio.create_task(_to_thread(tonapi_jetton_holder_addresses, jetton, 8))
+
+    gk, meta_j, dx, holders_raw, ston_pool, dedust_pool, lp_raw, holder_watch_addrs = await asyncio.gather(
+        gk_task, meta_task, dx_task, holders_task, ston_task, dedust_task, launchpad_task, holder_watch_task,
+        return_exceptions=True,
+    )
+
+    if isinstance(gk, Exception):
+        gk = None
+    if isinstance(meta_j, Exception) or not isinstance(meta_j, dict):
+        meta_j = {}
+    if isinstance(dx, Exception):
+        dx = {}
+    if isinstance(holders_raw, Exception):
+        holders_raw = None
+    if isinstance(ston_pool, Exception):
+        ston_pool = None
+    if isinstance(dedust_pool, Exception):
+        dedust_pool = None
+    if isinstance(lp_raw, Exception) or not isinstance(lp_raw, tuple):
+        lp_name, lp_watches = "", []
+    else:
+        lp_name, lp_watches = lp_raw
+    if isinstance(holder_watch_addrs, Exception) or not isinstance(holder_watch_addrs, list):
+        holder_watch_addrs = []
+
+    # Token metadata (GeckoTerminal first, then TonAPI meta cache, then DexScreener)
+    name = ((gk or {}).get("name") or "").strip()
+    sym = ((gk or {}).get("symbol") or "").strip()
+    if not name:
+        name = str(meta_j.get("name") or "").strip()
+    if not sym:
+        sym = str(meta_j.get("symbol") or "").strip()
+    if not name:
+        name = str((dx or {}).get("name") or "").strip()
+    if not sym:
+        sym = str((dx or {}).get("symbol") or "").strip()
     if not name:
         name = "Token"
     if not sym:
         sym = (name[:10] or "TOKEN").upper()
-    dex_mode = (dex_mode or "both").lower().strip()
-    # Seed holders once at setup so first buys show holders immediately.
+
     holders_seed: Optional[int] = None
     try:
-        info_h = await _to_thread(tonapi_jetton_info, jetton)
-        hh = info_h.get("holders_count")
+        hh = meta_j.get("holders_count")
         if hh is not None:
             holders_seed = int(hh)
     except Exception:
-        pass
+        holders_seed = None
     if holders_seed is None:
         try:
-            hh2 = await _to_thread(tonapi_jetton_holders_count, jetton)
-            if hh2 is not None:
-                holders_seed = int(hh2)
+            if holders_raw is not None:
+                holders_seed = int(holders_raw)
         except Exception:
-            pass
+            holders_seed = None
+
     # decimals for correct amount formatting
-    decimals_seed: int = 9
     try:
-        meta_j = await _to_thread(get_jetton_meta, jetton)
         decimals_seed = int(meta_j.get("decimals") or 9)
     except Exception:
         decimals_seed = 9
-
-    ston_pool = await _to_thread(find_stonfi_ton_pair_for_token, jetton) if dex_mode in ("both","ston","stonfi") else None
-    dedust_pool = await _to_thread(find_dedust_ton_pair_for_token, jetton) if dex_mode in ("both","dedust") else None
-    try:
-        lp_name, lp_watches = await _to_thread(launchpad_maps_for_token, jetton)
-    except Exception:
-        lp_name, lp_watches = "", []
-    try:
-        holder_watch_addrs = await _to_thread(tonapi_jetton_holder_addresses, jetton, 8)
-    except Exception:
-        holder_watch_addrs = []
 
     # If the user pasted a non-canonical address (e.g. a site-added suffix like "-Lone"),
     # we can still recover the correct jetton master from the resolved pool metadata.
