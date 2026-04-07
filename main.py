@@ -34,6 +34,7 @@ OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600")
 FAST_POST_MODE = str(os.getenv("FAST_POST_MODE", "1")).strip().lower() in ("1","true","yes","on")
 STARTUP_HISTORY_GRACE_SEC = max(0, int(float(os.getenv("STARTUP_HISTORY_GRACE_SEC", "120"))))
 PROCESS_START_TS = int(time.time())
+ASYNC_IO_WORKERS = max(8, int(float(os.getenv("ASYNC_IO_WORKERS", "24"))))
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/KYRONTrending").strip()
 DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/KYRONEco").strip()
@@ -3207,15 +3208,15 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sym_hint = _extract_symbol_hint(rest)
 
     # Build token record (reuse the same logic as group setup)
-    gk = gecko_token_info(jetton)
+    gk = await _to_thread(gecko_token_info, jetton)
     name = (gk.get("name") or "").strip() if gk else ""
     sym = (gk.get("symbol") or "").strip() if gk else ""
     if not name and not sym:
-        info = tonapi_jetton_info(jetton)
+        info = await _to_thread(tonapi_jetton_info, jetton)
         name = (info.get("name") or "").strip()
         sym = (info.get("symbol") or "").strip()
     if not name and not sym:
-        dx = dex_token_info(jetton)
+        dx = await _to_thread(dex_token_info, jetton)
         name = (dx.get("name") or "").strip()
         sym = (dx.get("symbol") or "").strip()
     if sym_hint:
@@ -3224,7 +3225,7 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Seed holders and decimals
     holders_seed: Optional[int] = None
     try:
-        info_h = tonapi_jetton_info(jetton)
+        info_h = await _to_thread(tonapi_jetton_info, jetton)
         hh = info_h.get("holders_count")
         if hh is not None:
             holders_seed = int(hh)
@@ -3232,21 +3233,29 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     if holders_seed is None:
         try:
-            hh2 = tonapi_jetton_holders_count(jetton)
+            hh2 = await _to_thread(tonapi_jetton_holders_count, jetton)
             if hh2 is not None:
                 holders_seed = int(hh2)
         except Exception:
             pass
     decimals_seed: int = 9
     try:
-        meta_j = get_jetton_meta(jetton)
+        meta_j = await _to_thread(get_jetton_meta, jetton)
         decimals_seed = int(meta_j.get("decimals") or 9)
     except Exception:
         decimals_seed = 9
 
     dm = (dex_mode or "both").lower().strip()
-    ston_pool = find_stonfi_ton_pair_for_token(jetton) if dm in ("both", "ston", "stonfi") else None
-    dedust_pool = find_dedust_ton_pair_for_token(jetton) if dm in ("both", "dedust") else None
+    ston_pool = await _to_thread(find_stonfi_ton_pair_for_token, jetton) if dm in ("both", "ston", "stonfi") else None
+    dedust_pool = await _to_thread(find_dedust_ton_pair_for_token, jetton) if dm in ("both", "dedust") else None
+    try:
+        lp_name, lp_watches = await _to_thread(launchpad_maps_for_token, jetton)
+    except Exception:
+        lp_name, lp_watches = "", []
+    try:
+        holder_watch_addrs = await _to_thread(tonapi_jetton_holder_addresses, jetton, 8)
+    except Exception:
+        holder_watch_addrs = []
 
     # Store token for global tracking
     tok = {
@@ -3259,14 +3268,12 @@ async def addtoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        **(lambda _lp_name, _lp_watches: {
-            "blum_mode": bool(_lp_name in ("blum", "gaspump", "groypi", "groypad")) or bool(_lp_watches),
-            "launchpad": (_lp_name if _lp_name else ""),
-            "launchpad_watch": (_lp_watches[0] if _lp_watches else ""),
-            "launchpad_watch_addresses": (_lp_watches + tonapi_jetton_holder_addresses(jetton, 8)),
-            "launchpad_opcode": "",
-            "launchpad_discovery_ts": 0,
-        })(*launchpad_maps_for_token(jetton)),
+        "blum_mode": bool(lp_name in ("blum", "gaspump", "groypi", "groypad")) or bool(lp_watches),
+        "launchpad": (lp_name if lp_name else ""),
+        "launchpad_watch": (lp_watches[0] if lp_watches else ""),
+        "launchpad_watch_addresses": (lp_watches + holder_watch_addrs),
+        "launchpad_opcode": "",
+        "launchpad_discovery_ts": 0,
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
         "blum_progress_pct": 0.0,
@@ -4449,7 +4456,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym = "TOKEN"
         holders = 0
         try:
-            info = tonapi_jetton_info(addr)
+            info = await _to_thread(tonapi_jetton_info, addr)
             name = (info.get("name") or name).strip()
             sym = (info.get("symbol") or sym).strip()
             holders = int(info.get("holders_count") or 0)
@@ -4613,21 +4620,21 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
     name = ""
     sym = ""
     try:
-        gk = gecko_token_info(jetton)
+        gk = await _to_thread(gecko_token_info, jetton)
         name = (gk.get("name") or "").strip() if gk else ""
         sym = (gk.get("symbol") or "").strip() if gk else ""
     except Exception:
         pass
     if not name and not sym:
         try:
-            info = tonapi_jetton_info(jetton)
+            info = await _to_thread(tonapi_jetton_info, jetton)
             name = (info.get("name") or "").strip()
             sym = (info.get("symbol") or "").strip()
         except Exception:
             pass
     if not name and not sym:
         try:
-            dx = dex_token_info(jetton)
+            dx = await _to_thread(dex_token_info, jetton)
             name = (dx.get("name") or "").strip()
             sym = (dx.get("symbol") or "").strip()
         except Exception:
@@ -4640,7 +4647,7 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
     # Seed holders once at setup so first buys show holders immediately.
     holders_seed: Optional[int] = None
     try:
-        info_h = tonapi_jetton_info(jetton)
+        info_h = await _to_thread(tonapi_jetton_info, jetton)
         hh = info_h.get("holders_count")
         if hh is not None:
             holders_seed = int(hh)
@@ -4648,7 +4655,7 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         pass
     if holders_seed is None:
         try:
-            hh2 = tonapi_jetton_holders_count(jetton)
+            hh2 = await _to_thread(tonapi_jetton_holders_count, jetton)
             if hh2 is not None:
                 holders_seed = int(hh2)
         except Exception:
@@ -4656,13 +4663,21 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
     # decimals for correct amount formatting
     decimals_seed: int = 9
     try:
-        meta_j = get_jetton_meta(jetton)
+        meta_j = await _to_thread(get_jetton_meta, jetton)
         decimals_seed = int(meta_j.get("decimals") or 9)
     except Exception:
         decimals_seed = 9
 
-    ston_pool = find_stonfi_ton_pair_for_token(jetton) if dex_mode in ("both","ston","stonfi") else None
-    dedust_pool = find_dedust_ton_pair_for_token(jetton) if dex_mode in ("both","dedust") else None
+    ston_pool = await _to_thread(find_stonfi_ton_pair_for_token, jetton) if dex_mode in ("both","ston","stonfi") else None
+    dedust_pool = await _to_thread(find_dedust_ton_pair_for_token, jetton) if dex_mode in ("both","dedust") else None
+    try:
+        lp_name, lp_watches = await _to_thread(launchpad_maps_for_token, jetton)
+    except Exception:
+        lp_name, lp_watches = "", []
+    try:
+        holder_watch_addrs = await _to_thread(tonapi_jetton_holder_addresses, jetton, 8)
+    except Exception:
+        holder_watch_addrs = []
 
     # If the user pasted a non-canonical address (e.g. a site-added suffix like "-Lone"),
     # we can still recover the correct jetton master from the resolved pool metadata.
@@ -4736,14 +4751,12 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "holders": holders_seed,
         "ston_pool": ston_pool,
         "dedust_pool": dedust_pool,
-        **(lambda _lp_name, _lp_watches: {
-            "blum_mode": bool(_lp_name in ("blum", "gaspump", "groypi", "groypad")) or bool(_lp_watches),
-            "launchpad": (_lp_name if _lp_name else ""),
-            "launchpad_watch": (_lp_watches[0] if _lp_watches else ""),
-            "launchpad_watch_addresses": (_lp_watches + tonapi_jetton_holder_addresses(jetton, 8)),
-            "launchpad_opcode": "",
-            "launchpad_discovery_ts": 0,
-        })(*launchpad_maps_for_token(jetton)),
+        "blum_mode": bool(lp_name in ("blum", "gaspump", "groypi", "groypad")) or bool(lp_watches),
+        "launchpad": (lp_name if lp_name else ""),
+        "launchpad_watch": (lp_watches[0] if lp_watches else ""),
+        "launchpad_watch_addresses": (lp_watches + holder_watch_addrs),
+        "launchpad_opcode": "",
+        "launchpad_discovery_ts": 0,
         "blum_cap_ton": float(BLUM_BONDING_CAP_TON),
         "blum_progress_ton": 0.0,
         "blum_progress_pct": 0.0,
@@ -5587,7 +5600,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         refresh_remote_market = False
 
     if pool_for_market and refresh_remote_market:
-        pinfo = gecko_pool_info(pool_for_market)
+        pinfo = await _to_thread(gecko_pool_info, pool_for_market)
         if pinfo:
             pv = _to_float(pinfo.get("price_usd"))
             if pv is not None:
@@ -5605,7 +5618,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         # even when GeckoTerminal returns a blank market cap.
         if mc_usd is None or liq_usd is None or price_usd is None:
             try:
-                dpair = _dex_pair_lookup(pool_for_market)
+                dpair = await _to_thread(_dex_pair_lookup, pool_for_market)
             except Exception:
                 dpair = None
             if isinstance(dpair, dict):
@@ -5618,7 +5631,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                     mc_usd = _to_float(dpair.get("marketCap") or dpair.get("market_cap") or dpair.get("fdv") or dpair.get("fdv_usd"))
 
     if (price_usd is None or mc_usd is None) and token.get("address") and refresh_remote_market:
-        tinfo = gecko_token_info(token["address"])
+        tinfo = await _to_thread(gecko_token_info, token["address"])
         if tinfo:
             if price_usd is None:
                 pv = _to_float(tinfo.get("price_usd"))
@@ -5653,7 +5666,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         # TonAPI Jetton info sometimes includes holders_count. If not, fall back
         # to the dedicated holders endpoint.
         try:
-            info = tonapi_jetton_info(jetton_addr)
+            info = await _to_thread(tonapi_jetton_info, jetton_addr)
             h = info.get("holders_count")
             if h is not None:
                 holders = int(h)
@@ -5661,7 +5674,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
             pass
         if holders is None:
             try:
-                h2 = tonapi_jetton_holders_count(jetton_addr)
+                h2 = await _to_thread(tonapi_jetton_holders_count, jetton_addr)
                 if h2 is not None:
                     holders = int(h2)
             except Exception:
@@ -5685,7 +5698,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
         total_supply = None
     if total_supply is None and jetton_addr and refresh_remote_market:
         try:
-            info = tonapi_get(f"{TONAPI_BASE}/v2/jettons/{jetton_addr}") or {}
+            info = await _to_thread(tonapi_get, f"{TONAPI_BASE}/v2/jettons/{jetton_addr}") or {}
             meta = info.get("metadata") or {}
             dec_raw = (meta.get("decimals") if isinstance(meta, dict) else None)
             if dec_raw is None:
@@ -5810,7 +5823,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     if not tx_hex and source == "DeDust":
         lt_guess = str(b.get("trade_id") or tx or "").strip()
         if lt_guess:
-            resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=300)
+            resolved = await _to_thread(tonapi_find_tx_hash_by_lt, str(dedust_pool or ""), lt_guess, 300)
             if not resolved:
                 # quick retries for busy pools
                 for _ in range(3):
@@ -5818,7 +5831,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
                         time.sleep(0.35)
                     except Exception:
                         pass
-                    resolved = tonapi_find_tx_hash_by_lt(str(dedust_pool or ""), lt_guess, limit=600)
+                    resolved = await _to_thread(tonapi_find_tx_hash_by_lt, str(dedust_pool or ""), lt_guess, 600)
                     if resolved:
                         break
             tx_hex = _normalize_tx_hash_to_hex(resolved) or tx_hex
@@ -5830,7 +5843,7 @@ async def post_buy(app: Application, chat_id: int, token: Dict[str, Any], b: Dic
     change_pct = None
     try:
         if pair_for_links:
-            _p = _dex_pair_lookup(pair_for_links)
+            _p = await _to_thread(_dex_pair_lookup, pair_for_links)
             if isinstance(_p, dict):
                 _pc = _p.get("priceChange") or {}
                 _ch = None
@@ -6683,6 +6696,15 @@ def run_flask():
 
 # -------------------- MAIN --------------------
 async def post_init(app: Application):
+    # grow the default thread pool so blocking HTTP helpers moved via asyncio.to_thread
+    # do not stall command handlers or the tracker loop under load.
+    try:
+        import concurrent.futures
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=ASYNC_IO_WORKERS))
+    except Exception:
+        pass
+
     # start tracker
     app.create_task(tracker_loop(app))
     log.info("Tracker started.")
@@ -6695,7 +6717,13 @@ async def post_init(app: Application):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is missing.")
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("lang", lang_cmd))
