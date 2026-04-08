@@ -1560,14 +1560,15 @@ AWAITING_IMAGE: Dict[int, int] = {}
 
 # user_id -> {'chat_id': int, 'field': 'step'|'min_buy'|'telegram'|'emoji'}
 AWAITING_EDIT_INPUT: Dict[int, Dict[str, Any]] = {}
+ADMIN_CACHE: Dict[str, Dict[str, Any]] = {}
+ADMIN_CACHE_TTL = 60
+
 
 # preview cache for add-token confirm flow; key is f"{chat_id}:{user_id}"
 PENDING_TOKEN_PREVIEW: Dict[str, Dict[str, Any]] = {}
 
 # user_id -> awaiting custom strength emoji text (can be normal emoji or <tg-emoji ...>)
 AWAITING_CUSTOM_EMOJI: Dict[int, int] = {}  # user_id -> chat_id
-ADMIN_CACHE: Dict[str, Dict[str, Any]] = {}
-ADMIN_CACHE_TTL = max(10, int(float(os.getenv("ADMIN_CACHE_TTL", "60"))))
 
 # -------------------- HELPERS --------------------
 JETTON_RE = re.compile(r"\b([EU]Q[A-Za-z0-9_-]{40,80})\b")
@@ -1580,19 +1581,21 @@ def is_private(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.type == "private")
 
 async def is_admin(bot, chat_id: int, user_id: int) -> bool:
-    key = f"{int(chat_id)}:{int(user_id)}"
+    key = f"{chat_id}:{user_id}"
     now = time.time()
-    hit = ADMIN_CACHE.get(key)
-    if isinstance(hit, dict) and (now - float(hit.get("ts") or 0) < ADMIN_CACHE_TTL):
-        return bool(hit.get("ok"))
+    cached = ADMIN_CACHE.get(key) or {}
+    try:
+        if cached and (now - float(cached.get("ts") or 0) <= ADMIN_CACHE_TTL):
+            return bool(cached.get("ok"))
+    except Exception:
+        pass
     try:
         m = await bot.get_chat_member(chat_id, user_id)
         ok = m.status in ("administrator", "creator")
         ADMIN_CACHE[key] = {"ts": now, "ok": ok}
         return ok
     except Exception:
-        ADMIN_CACHE[key] = {"ts": now, "ok": False}
-        return False
+        return bool(cached.get("ok", False))
 
 def get_group(chat_id: int) -> Dict[str, Any]:
     key = str(chat_id)
@@ -1827,7 +1830,7 @@ async def dedust_latest_trades(pool: str, limit: int = 25) -> List[Dict[str, Any
     except Exception:
         return []
 
-async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: str|None, fast: bool = False):
+async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: str|None):
     """Mark latest swaps as seen so the bot does not spam old buys right after configuration.
     Also sets baseline last_* ids so we skip anything older than the moment the token was configured."""
     try:
@@ -1844,7 +1847,7 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
 
         # STON.fi (warmup by pool tx hashes from TonAPI)
         if ston_pool:
-            swaps = await stonfi_latest_swaps(ston_pool, limit=(4 if fast else 40))
+            swaps = await stonfi_latest_swaps(ston_pool, limit=40)
             for s in swaps:
                 txhash = (s.get('tx_hash') or s.get('txHash') or s.get('hash') or '').strip()
                 if txhash:
@@ -1852,7 +1855,7 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                     if newest_ston is None:
                         newest_ston = txhash  # first item is newest
             try:
-                ston_events0 = await _to_thread(tonapi_account_events, ston_pool, (4 if fast else 40))
+                ston_events0 = await _to_thread(tonapi_account_events, ston_pool, 40)
                 if isinstance(ston_events0, list) and ston_events0:
                     newest0 = ston_events0[0]
                     newest_ston_eid = str(newest0.get('event_id') or newest0.get('id') or '').strip() or newest_ston_eid
@@ -1865,12 +1868,12 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
 
         # DeDust (warmup by latest trade ids and tx hashes where available)
         if dedust_pool:
-            trades = await dedust_latest_trades(dedust_pool, limit=(6 if fast else 60))
+            trades = await dedust_latest_trades(dedust_pool, limit=60)
             # TonAPI events baseline for DeDust pools that don't expose /trades yet (new/legacy pools)
             if not trades:
                 try:
                     # Full /events is safer for DeDust pools; subject_only can omit TON transfers.
-                    events = await _to_thread(tonapi_account_events, dedust_pool, (4 if fast else 40))
+                    events = await _to_thread(tonapi_account_events, dedust_pool, 40)
                     if isinstance(events, list) and events:
                         newest = events[0]  # newest first
                         eid = str(newest.get('event_id') or newest.get('id') or '').strip()
@@ -1923,7 +1926,7 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
             if isinstance(tok0, dict) and bool(tok0.get("blum_mode")) and tok0.get("address"):
                 total_ton = 0.0
                 for watch_addr0 in launchpad_watch_addresses(tok0):
-                    evs = await _to_thread(tonapi_account_events, watch_addr0, (min(12, BLUM_EVENT_LIMIT) if fast else BLUM_EVENT_LIMIT))
+                    evs = await _to_thread(tonapi_account_events, watch_addr0, BLUM_EVENT_LIMIT)
                     if isinstance(evs, list) and evs:
                         newest = evs[0]
                         newest_blum_eid = str(newest.get("event_id") or newest.get("id") or "").strip() or newest_blum_eid
@@ -1931,20 +1934,19 @@ async def warmup_seen_for_chat(chat_id: int, ston_pool: str|None, dedust_pool: s
                             newest_blum_ts = int(newest.get("timestamp") or 0) or newest_blum_ts
                         except Exception:
                             pass
-                        if not fast:
-                            for ev in reversed(evs):
-                                buys = blum_extract_buys_from_tonapi_event(ev, tok0.get("address"))
-                                for b in buys:
-                                    try:
-                                        total_ton += max(0.0, float(b.get("ton") or 0.0))
-                                    except Exception:
-                                        pass
-                    txs = await _to_thread(tonapi_account_transactions, watch_addr0, (min(12, BLUM_TX_LIMIT) if fast else BLUM_TX_LIMIT))
+                        for ev in reversed(evs):
+                            buys = blum_extract_buys_from_tonapi_event(ev, tok0.get("address"))
+                            for b in buys:
+                                try:
+                                    total_ton += max(0.0, float(b.get("ton") or 0.0))
+                                except Exception:
+                                    pass
+                    txs = await _to_thread(tonapi_account_transactions, watch_addr0, BLUM_TX_LIMIT)
                     if isinstance(txs, list) and txs:
                         newest_tx0 = txs[0]
                         newest_blum_tx = str(_tx_hash(newest_tx0) or "").strip() or newest_blum_tx
                         newest_blum_lt = str(newest_tx0.get("lt") or "").strip() or newest_blum_lt
-                        if (not fast) and total_ton <= 0:
+                        if total_ton <= 0:
                             for txo in reversed(txs):
                                 buys = blum_extract_buys_from_tonapi_tx(txo, tok0.get("address"))
                                 for b in buys:
@@ -4483,8 +4485,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     processing_msg = None
     try:
-        if chat.type == "private":
-            processing_msg = await update.message.reply_text("⏳ Token received. Processing pools now...")
+        processing_msg = await update.message.reply_text("⏳ Token received. Processing now...")
         await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id, telegram=tg_url, dex_mode=dex_mode)
     except Exception as e:
         log.exception("handle_text configure failed for chat=%s user=%s", target_chat_id, user.id)
@@ -4626,43 +4627,56 @@ async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(_settings_words(_get_group_lang(chat.id, user.id))["cancel"])
         return
 
+async def _warmup_seen_background(chat_id: int, ston_pool: str | None, dedust_pool: str | None):
+    try:
+        await warmup_seen_for_chat(chat_id, ston_pool, dedust_pool)
+    except Exception:
+        log.exception("background warmup failed for chat=%s", chat_id)
+
 async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int, telegram: str = "", dex_mode: str = "both", announce: bool = True):
     dex_mode = (dex_mode or "both").lower().strip()
 
-    gecko_task = _to_thread(gecko_token_info, jetton)
-    tonapi_info_task = _to_thread(tonapi_jetton_info, jetton)
-    dex_info_task = _to_thread(dex_token_info, jetton)
-    meta_task = _to_thread(get_jetton_meta, jetton)
-    holders_task = _to_thread(tonapi_jetton_holders_count, jetton)
-    ston_task = _to_thread(find_stonfi_ton_pair_for_token, jetton) if dex_mode in ("both", "ston", "stonfi") else asyncio.sleep(0, result=None)
-    dedust_task = _to_thread(find_dedust_ton_pair_for_token, jetton) if dex_mode in ("both", "dedust") else asyncio.sleep(0, result=None)
-    launchpad_task = _to_thread(launchpad_maps_for_token, jetton)
-    holder_watch_task = _to_thread(tonapi_jetton_holder_addresses, jetton, 8)
+    # Fast parallel fetches so add/edit token responds quickly.
+    gecko_task = asyncio.create_task(_to_thread(gecko_token_info, jetton))
+    tonapi_info_task = asyncio.create_task(_to_thread(tonapi_jetton_info, jetton))
+    dex_task = asyncio.create_task(_to_thread(dex_token_info, jetton))
+    meta_task = asyncio.create_task(_to_thread(get_jetton_meta, jetton))
+    holders_task = asyncio.create_task(_to_thread(tonapi_jetton_holders_count, jetton))
+    launchpad_task = asyncio.create_task(_to_thread(launchpad_maps_for_token, jetton))
+    holder_watch_task = asyncio.create_task(_to_thread(tonapi_jetton_holder_addresses, jetton, 8))
+    ston_task = asyncio.create_task(_to_thread(find_stonfi_ton_pair_for_token, jetton)) if dex_mode in ("both", "ston", "stonfi") else None
+    dedust_task = asyncio.create_task(_to_thread(find_dedust_ton_pair_for_token, jetton)) if dex_mode in ("both", "dedust") else None
 
-    gecko_res, tonapi_info_res, dex_info_res, meta_res, holders_res, ston_pool, dedust_pool, launchpad_res, holder_watch_addrs = await asyncio.gather(
-        gecko_task,
-        tonapi_info_task,
-        dex_info_task,
-        meta_task,
-        holders_task,
-        ston_task,
-        dedust_task,
-        launchpad_task,
-        holder_watch_task,
+    gk, info_h, dx, meta_j, holders_fallback, lp_res, holder_watch_addrs = await asyncio.gather(
+        gecko_task, tonapi_info_task, dex_task, meta_task, holders_task, launchpad_task, holder_watch_task,
         return_exceptions=True,
     )
+    ston_pool = await ston_task if ston_task else None
+    dedust_pool = await dedust_task if dedust_task else None
 
-    gk = gecko_res if isinstance(gecko_res, dict) else {}
-    info = tonapi_info_res if isinstance(tonapi_info_res, dict) else {}
-    dx = dex_info_res if isinstance(dex_info_res, dict) else {}
-    meta_j = meta_res if isinstance(meta_res, dict) else {}
-    lp_name, lp_watches = launchpad_res if (isinstance(launchpad_res, tuple) and len(launchpad_res) == 2) else ("", [])
-    holder_watch_addrs = holder_watch_addrs if isinstance(holder_watch_addrs, list) else []
-    ston_pool = ston_pool if isinstance(ston_pool, str) and ston_pool else None
-    dedust_pool = dedust_pool if isinstance(dedust_pool, str) and dedust_pool else None
+    if isinstance(gk, Exception):
+        gk = None
+    if isinstance(info_h, Exception):
+        info_h = {}
+    if isinstance(dx, Exception):
+        dx = None
+    if isinstance(meta_j, Exception):
+        meta_j = {}
+    if isinstance(holders_fallback, Exception):
+        holders_fallback = None
+    if isinstance(lp_res, Exception):
+        lp_res = ("", [])
+    if isinstance(holder_watch_addrs, Exception):
+        holder_watch_addrs = []
 
-    name = (gk.get("name") or info.get("name") or dx.get("name") or "").strip()
-    sym = (gk.get("symbol") or info.get("symbol") or dx.get("symbol") or "").strip()
+    name = ((gk or {}).get("name") or "").strip()
+    sym = ((gk or {}).get("symbol") or "").strip()
+    if not name and not sym:
+        name = ((info_h or {}).get("name") or "").strip()
+        sym = ((info_h or {}).get("symbol") or "").strip()
+    if not name and not sym:
+        name = ((dx or {}).get("name") or "").strip()
+        sym = ((dx or {}).get("symbol") or "").strip()
     if not name:
         name = "Token"
     if not sym:
@@ -4670,23 +4684,27 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
 
     holders_seed: Optional[int] = None
     try:
-        hh = info.get("holders_count")
+        hh = (info_h or {}).get("holders_count")
         if hh is not None:
             holders_seed = int(hh)
     except Exception:
         holders_seed = None
     if holders_seed is None:
         try:
-            if not isinstance(holders_res, Exception) and holders_res is not None:
-                holders_seed = int(holders_res)
+            if holders_fallback is not None:
+                holders_seed = int(holders_fallback)
         except Exception:
             holders_seed = None
 
-    decimals_seed: int = 9
     try:
-        decimals_seed = int(meta_j.get("decimals") or info.get("decimals") or 9)
+        decimals_seed = int((meta_j or {}).get("decimals") or 9)
     except Exception:
         decimals_seed = 9
+
+    try:
+        lp_name, lp_watches = lp_res
+    except Exception:
+        lp_name, lp_watches = "", []
 
     # If the user pasted a non-canonical address (e.g. a site-added suffix like "-Lone"),
     # we can still recover the correct jetton master from the resolved pool metadata.
@@ -4714,22 +4732,6 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
                 if recovered and recovered != jetton:
                     log.warning("Jetton address corrected via pool metadata: %s -> %s", jetton, recovered)
                     jetton = recovered
-
-                    # Refresh metadata using the corrected address (best-effort).
-                    gk2 = gecko_token_info(jetton)
-                    name2 = (gk2.get("name") or "").strip() if gk2 else ""
-                    sym2 = (gk2.get("symbol") or "").strip() if gk2 else ""
-                    if not name2 and not sym2:
-                        info2 = tonapi_jetton_info(jetton)
-                        name2 = (info2.get("name") or "").strip()
-                        sym2 = (info2.get("symbol") or "").strip()
-                    if not name2 and not sym2:
-                        dx2 = dex_token_info(jetton)
-                        name2 = (dx2.get("name") or "").strip()
-                        sym2 = (dx2.get("symbol") or "").strip()
-                    if name2 or sym2:
-                        name = name2 or name
-                        sym = sym2 or sym
         except Exception:
             pass
 
@@ -4785,18 +4787,17 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "burst": {"window_start": int(time.time()), "count": 0},
         "telegram": telegram.strip() if telegram else "",
     }
-    save_groups()
-
-    # Prevent posting old buys right after configuration
-    await warmup_seen_for_chat(chat_id, ston_pool, dedust_pool, fast=True)
-    # Mark init done so tracker loop doesn't skip another full cycle
+    # Make the token active immediately.
     try:
-        g2 = get_group(chat_id)
-        if isinstance(g2.get('token'), dict):
-            g2['token']['init_done'] = True
-            save_groups()
+        if isinstance(g.get("token"), dict):
+            g["token"]["init_done"] = True
+            g["token"]["ignore_before_ts"] = int(time.time())
     except Exception:
         pass
+    save_groups()
+
+    # Warmup in background so add token returns fast, without replaying old buys.
+    asyncio.create_task(_warmup_seen_background(chat_id, ston_pool, dedust_pool))
 
     disp = sym or name or "TOKEN"
     safe_disp = re.sub(r"([_\*\[\]\(\)~`>#+\-=|{}.!])", r"\\\1", str(disp))
