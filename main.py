@@ -1285,8 +1285,14 @@ def blum_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str, expect
     launchpad_like_in = bool(detected_launchpad) or any(x in (in_op or "") for x in LAUNCHPAD_BUY_OPS) or any(x in in_blob for x in LAUNCHPAD_BUY_OPS)
     exp_watch = _norm_addr(expected_watch)
     exp_op = _norm_opcode_value(expected_opcode)
-    if exp_watch and _norm_addr(in_dest) and _norm_addr(in_dest) != exp_watch:
-        return []
+    # Some Blum bonding buys hit the token master directly, while others go through
+    # a discovered launchpad/router watch address first. Accept either the expected
+    # watch address or the token address, otherwise valid Blum buys can be skipped.
+    if exp_watch and _norm_addr(in_dest):
+        in_dest_norm = _norm_addr(in_dest)
+        token_addr_norm = _norm_addr(token_addr)
+        if in_dest_norm != exp_watch and (not token_addr_norm or in_dest_norm != token_addr_norm):
+            return []
     if exp_op and in_op and _norm_opcode_value(in_op) != exp_op:
         return []
     if (not launchpad_like_in) and ton_in > 0 and tx_hash and ("groypad" in in_blob or "groyp" in in_blob or "dtrade" in in_blob):
@@ -1560,9 +1566,6 @@ AWAITING_IMAGE: Dict[int, int] = {}
 
 # user_id -> {'chat_id': int, 'field': 'step'|'min_buy'|'telegram'|'emoji'}
 AWAITING_EDIT_INPUT: Dict[int, Dict[str, Any]] = {}
-ADMIN_CACHE: Dict[str, Dict[str, Any]] = {}
-ADMIN_CACHE_TTL = 60
-
 
 # preview cache for add-token confirm flow; key is f"{chat_id}:{user_id}"
 PENDING_TOKEN_PREVIEW: Dict[str, Dict[str, Any]] = {}
@@ -1581,21 +1584,11 @@ def is_private(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.type == "private")
 
 async def is_admin(bot, chat_id: int, user_id: int) -> bool:
-    key = f"{chat_id}:{user_id}"
-    now = time.time()
-    cached = ADMIN_CACHE.get(key) or {}
-    try:
-        if cached and (now - float(cached.get("ts") or 0) <= ADMIN_CACHE_TTL):
-            return bool(cached.get("ok"))
-    except Exception:
-        pass
     try:
         m = await bot.get_chat_member(chat_id, user_id)
-        ok = m.status in ("administrator", "creator")
-        ADMIN_CACHE[key] = {"ts": now, "ok": ok}
-        return ok
+        return m.status in ("administrator", "creator")
     except Exception:
-        return bool(cached.get("ok", False))
+        return False
 
 def get_group(chat_id: int) -> Dict[str, Any]:
     key = str(chat_id)
@@ -4485,7 +4478,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     processing_msg = None
     try:
-        processing_msg = await update.message.reply_text("⏳ Token received. Processing now...")
+        if chat.type == "private":
+            processing_msg = await update.message.reply_text("⏳ Token received. Processing pools now...")
         await configure_group_token(target_chat_id, addr, context, reply_to_chat=chat.id, telegram=tg_url, dex_mode=dex_mode)
     except Exception as e:
         log.exception("handle_text configure failed for chat=%s user=%s", target_chat_id, user.id)
@@ -4627,84 +4621,69 @@ async def on_replace_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(_settings_words(_get_group_lang(chat.id, user.id))["cancel"])
         return
 
-async def _warmup_seen_background(chat_id: int, ston_pool: str | None, dedust_pool: str | None):
-    try:
-        await warmup_seen_for_chat(chat_id, ston_pool, dedust_pool)
-    except Exception:
-        log.exception("background warmup failed for chat=%s", chat_id)
-
 async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAULT_TYPE, reply_chat_id: int, telegram: str = "", dex_mode: str = "both", announce: bool = True):
-    dex_mode = (dex_mode or "both").lower().strip()
-
-    # Fast parallel fetches so add/edit token responds quickly.
-    gecko_task = asyncio.create_task(_to_thread(gecko_token_info, jetton))
-    tonapi_info_task = asyncio.create_task(_to_thread(tonapi_jetton_info, jetton))
-    dex_task = asyncio.create_task(_to_thread(dex_token_info, jetton))
-    meta_task = asyncio.create_task(_to_thread(get_jetton_meta, jetton))
-    holders_task = asyncio.create_task(_to_thread(tonapi_jetton_holders_count, jetton))
-    launchpad_task = asyncio.create_task(_to_thread(launchpad_maps_for_token, jetton))
-    holder_watch_task = asyncio.create_task(_to_thread(tonapi_jetton_holder_addresses, jetton, 8))
-    ston_task = asyncio.create_task(_to_thread(find_stonfi_ton_pair_for_token, jetton)) if dex_mode in ("both", "ston", "stonfi") else None
-    dedust_task = asyncio.create_task(_to_thread(find_dedust_ton_pair_for_token, jetton)) if dex_mode in ("both", "dedust") else None
-
-    gk, info_h, dx, meta_j, holders_fallback, lp_res, holder_watch_addrs = await asyncio.gather(
-        gecko_task, tonapi_info_task, dex_task, meta_task, holders_task, launchpad_task, holder_watch_task,
-        return_exceptions=True,
-    )
-    ston_pool = await ston_task if ston_task else None
-    dedust_pool = await dedust_task if dedust_task else None
-
-    if isinstance(gk, Exception):
-        gk = None
-    if isinstance(info_h, Exception):
-        info_h = {}
-    if isinstance(dx, Exception):
-        dx = None
-    if isinstance(meta_j, Exception):
-        meta_j = {}
-    if isinstance(holders_fallback, Exception):
-        holders_fallback = None
-    if isinstance(lp_res, Exception):
-        lp_res = ("", [])
-    if isinstance(holder_watch_addrs, Exception):
-        holder_watch_addrs = []
-
-    name = ((gk or {}).get("name") or "").strip()
-    sym = ((gk or {}).get("symbol") or "").strip()
+    # Token metadata (GeckoTerminal first, then TonAPI, then DexScreener)
+    name = ""
+    sym = ""
+    try:
+        gk = await _to_thread(gecko_token_info, jetton)
+        name = (gk.get("name") or "").strip() if gk else ""
+        sym = (gk.get("symbol") or "").strip() if gk else ""
+    except Exception:
+        pass
     if not name and not sym:
-        name = ((info_h or {}).get("name") or "").strip()
-        sym = ((info_h or {}).get("symbol") or "").strip()
+        try:
+            info = await _to_thread(tonapi_jetton_info, jetton)
+            name = (info.get("name") or "").strip()
+            sym = (info.get("symbol") or "").strip()
+        except Exception:
+            pass
     if not name and not sym:
-        name = ((dx or {}).get("name") or "").strip()
-        sym = ((dx or {}).get("symbol") or "").strip()
+        try:
+            dx = await _to_thread(dex_token_info, jetton)
+            name = (dx.get("name") or "").strip()
+            sym = (dx.get("symbol") or "").strip()
+        except Exception:
+            pass
     if not name:
         name = "Token"
     if not sym:
         sym = (name[:10] or "TOKEN").upper()
-
+    dex_mode = (dex_mode or "both").lower().strip()
+    # Seed holders once at setup so first buys show holders immediately.
     holders_seed: Optional[int] = None
     try:
-        hh = (info_h or {}).get("holders_count")
+        info_h = await _to_thread(tonapi_jetton_info, jetton)
+        hh = info_h.get("holders_count")
         if hh is not None:
             holders_seed = int(hh)
     except Exception:
-        holders_seed = None
+        pass
     if holders_seed is None:
         try:
-            if holders_fallback is not None:
-                holders_seed = int(holders_fallback)
+            hh2 = await _to_thread(tonapi_jetton_holders_count, jetton)
+            if hh2 is not None:
+                holders_seed = int(hh2)
         except Exception:
-            holders_seed = None
-
+            pass
+    # decimals for correct amount formatting
+    decimals_seed: int = 9
     try:
-        decimals_seed = int((meta_j or {}).get("decimals") or 9)
+        meta_j = await _to_thread(get_jetton_meta, jetton)
+        decimals_seed = int(meta_j.get("decimals") or 9)
     except Exception:
         decimals_seed = 9
 
+    ston_pool = await _to_thread(find_stonfi_ton_pair_for_token, jetton) if dex_mode in ("both","ston","stonfi") else None
+    dedust_pool = await _to_thread(find_dedust_ton_pair_for_token, jetton) if dex_mode in ("both","dedust") else None
     try:
-        lp_name, lp_watches = lp_res
+        lp_name, lp_watches = await _to_thread(launchpad_maps_for_token, jetton)
     except Exception:
         lp_name, lp_watches = "", []
+    try:
+        holder_watch_addrs = await _to_thread(tonapi_jetton_holder_addresses, jetton, 8)
+    except Exception:
+        holder_watch_addrs = []
 
     # If the user pasted a non-canonical address (e.g. a site-added suffix like "-Lone"),
     # we can still recover the correct jetton master from the resolved pool metadata.
@@ -4732,6 +4711,22 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
                 if recovered and recovered != jetton:
                     log.warning("Jetton address corrected via pool metadata: %s -> %s", jetton, recovered)
                     jetton = recovered
+
+                    # Refresh metadata using the corrected address (best-effort).
+                    gk2 = gecko_token_info(jetton)
+                    name2 = (gk2.get("name") or "").strip() if gk2 else ""
+                    sym2 = (gk2.get("symbol") or "").strip() if gk2 else ""
+                    if not name2 and not sym2:
+                        info2 = tonapi_jetton_info(jetton)
+                        name2 = (info2.get("name") or "").strip()
+                        sym2 = (info2.get("symbol") or "").strip()
+                    if not name2 and not sym2:
+                        dx2 = dex_token_info(jetton)
+                        name2 = (dx2.get("name") or "").strip()
+                        sym2 = (dx2.get("symbol") or "").strip()
+                    if name2 or sym2:
+                        name = name2 or name
+                        sym = sym2 or sym
         except Exception:
             pass
 
@@ -4787,17 +4782,18 @@ async def _set_token_now(chat_id: int, jetton: str, context: ContextTypes.DEFAUL
         "burst": {"window_start": int(time.time()), "count": 0},
         "telegram": telegram.strip() if telegram else "",
     }
-    # Make the token active immediately.
-    try:
-        if isinstance(g.get("token"), dict):
-            g["token"]["init_done"] = True
-            g["token"]["ignore_before_ts"] = int(time.time())
-    except Exception:
-        pass
     save_groups()
 
-    # Warmup in background so add token returns fast, without replaying old buys.
-    asyncio.create_task(_warmup_seen_background(chat_id, ston_pool, dedust_pool))
+    # Prevent posting old buys right after configuration
+    await warmup_seen_for_chat(chat_id, ston_pool, dedust_pool)
+    # Mark init done so tracker loop doesn't skip another full cycle
+    try:
+        g2 = get_group(chat_id)
+        if isinstance(g2.get('token'), dict):
+            g2['token']['init_done'] = True
+            save_groups()
+    except Exception:
+        pass
 
     disp = sym or name or "TOKEN"
     safe_disp = re.sub(r"([_\*\[\]\(\)~`>#+\-=|{}.!])", r"\\\1", str(disp))
@@ -5504,7 +5500,10 @@ async def poll_once(app: Application):
                         buys = blum_extract_buys_from_tonapi_tx(
                             txo,
                             token["address"],
-                            expected_watch=(watch_addr if watch_addr != token.get("address") else (token.get("launchpad_watch") or "")),
+                            # When scanning the token address itself, do not force the
+                            # router watch address here. Blum memepad buys can land on
+                            # the token master directly, like the supplied sample tx.
+                            expected_watch=(watch_addr if _norm_addr(watch_addr) != _norm_addr(token.get("address")) else token.get("address")),
                             expected_opcode=token.get("launchpad_opcode") or "",
                         )
                         posted_here = []
