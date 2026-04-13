@@ -28,8 +28,8 @@ POLL_INTERVAL = max(0.20, float(os.getenv("POLL_INTERVAL", "0.35")))
 TONAPI_TIMEOUT = max(3.0, float(os.getenv("TONAPI_TIMEOUT", "8")))
 STON_TX_FALLBACK = str(os.getenv("STON_TX_FALLBACK", "0")).strip().lower() in ("1","true","yes","on")
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
-OLD_BUY_MAX_AGE_SEC = max(120, int(float(os.getenv("OLD_BUY_MAX_AGE_SEC", "600"))))
-STARTUP_HISTORY_GRACE_SEC = max(0, int(float(os.getenv("STARTUP_HISTORY_GRACE_SEC", "120"))))
+OLD_BUY_MAX_AGE_SEC = 86400  # increased to avoid missing buys
+STARTUP_HISTORY_GRACE_SEC = 0  # disable skipping history
 PROCESS_START_TS = int(time.time())
 DTRADE_REF = os.getenv("DTRADE_REF", "https://t.me/dtrade?start=11TYq7LInG").strip()
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/KYRONTrending").strip()
